@@ -1,0 +1,34 @@
+# VLLMEndpoint Template — the simple default: one model, one vLLM pod.
+# Copy this file into a TARGET-NAMESPACE subdirectory and rename it to your model
+# name, e.g. workloads/models/inference/gemma-4b.yaml (platform-shared) or
+# workloads/models/team-search/gemma-4b.yaml (a team's namespace). The DIRECTORY
+# name is the namespace — do NOT set metadata.namespace here. Only 'model' is
+# required; everything else has sensible defaults. See workloads/models/README.md.
+#
+# After committing, ArgoCD syncs automatically. Track progress with:
+#   kubectl get vllmendpoints -n <namespace> -w
+#
+# For a horizontally-scaled, KV-cache/load/prefix-aware tier, use an LLMDEndpoint
+# (workloads/scale-models/) instead.
+apiVersion: kro.run/v1alpha1
+kind: VLLMEndpoint
+metadata:
+  name: my-model              # Also becomes the LiteLLM model name for API calls
+  # namespace: inherited from the directory (workloads/models/<namespace>/) — do NOT set it
+spec:
+  model: "org/model-id"       # REQUIRED — HuggingFace model ID (e.g. google/gemma-3-4b-it)
+  # gpuCount: 1               # GPUs per pod. Must be 1, 2, 4, or 8 (tensor parallelism).
+  # shared: false             # Use GPU time-slicing (4 models share 1 GPU). Good for small models.
+  #                           # Use https://apxml.com/tools/vram-calculator to check if your model fits.
+  # replicas: 1               # Fixed pod count. The vLLM tier is fixed-size — to autoscale, use LLMDEndpoint.
+  # workerMemory: "12Gi"      # Memory per GPU pod. Increase for larger models.
+  # workerCpu: "4"            # CPU per GPU pod
+  # maxModelLen: 8192         # Max sequence length. Lower = less GPU memory, faster.
+  # minVramPerGpuGiB: 0       # Min per-GPU VRAM in GiB (Karpenter hint). 0 = no floor.
+  #                           # Set this to exclude T4 (16 GB) if you need L4/A10G (24+) —
+  #                           # `platformctl new-model` emits the right value automatically.
+  # vllmImage: "vllm/vllm-openai:v0.24.0"  # Override only if needed
+#
+# Unsure what size GPU / how many GPUs your model needs?
+# Run: ./platformctl new-model org/model-id --seq 8192 --users 4
+# It computes VRAM from the HuggingFace config and suggests the right GPU sizing.

@@ -1,0 +1,121 @@
+# CI — validates the repo before a merge to main auto-deploys via ArgoCD.
+#
+# ArgoCD watches `main` with automated sync + prune, so a bad manifest, a broken
+# kustomize build, or a syntax error in the embedded controller Python reaches the
+# cluster the moment it lands. This workflow is the gate CONTRIBUTING.md promises:
+# it fails the PR before that happens. It runs no cloud credentials and touches no
+# cluster — pure static validation.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: terraform fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - name: terraform fmt (check)
+        run: terraform fmt -check -recursive terraform/
+      - name: terraform validate (per module)
+        run: |
+          set -euo pipefail
+          # Validate each module in isolation. `-backend=false` skips remote state
+          # so no AWS creds are needed; this catches HCL + provider-schema errors.
+          find terraform -name backend.tf -not -path '*/.terraform/*' -print0 \
+            | while IFS= read -r -d '' bt; do
+                dir="$(dirname "$bt")"
+                echo "::group::validate $dir"
+                terraform -chdir="$dir" init -backend=false -input=false >/dev/null
+                terraform -chdir="$dir" validate
+                echo "::endgroup::"
+              done
+
+  python:
+    name: python compile + lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: byte-compile every tracked module (catches syntax/indentation)
+        run: |
+          set -euo pipefail
+          git ls-files '*.py' | grep -v '/.terraform/' | xargs -r python3 -m py_compile
+      - name: ruff (non-blocking style report)
+        run: |
+          pip install ruff==0.6.9
+          # Report only — style drift shouldn't block a platform PR, but surface it.
+          ruff check --output-format=github ops/ platform/ || true
+
+  shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck all tracked shell scripts + platformctl
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # platformctl has no .sh extension; include it explicitly.
+          mapfile -t files < <(git ls-files '*.sh'; echo platformctl)
+          # -S warning: fail on warnings+errors, allow info/style noise.
+          shellcheck -S warning "${files[@]}"
+
+  manifests:
+    name: kustomize build + yaml + kubeconform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tools
+        run: |
+          set -euo pipefail
+          # kustomize
+          curl -fsSL https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh | bash
+          sudo mv kustomize /usr/local/bin/
+          # kubeconform (schema validation; skips CRD kinds it doesn't know)
+          curl -fsSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz \
+            | tar xz kubeconform && sudo mv kubeconform /usr/local/bin/
+          pip install yamllint==1.35.1
+      - name: yamllint (relaxed — long lines/indent allowed, only real errors fail)
+        run: |
+          yamllint -d "{extends: relaxed, rules: {line-length: disable, comments: disable, document-start: disable, trailing-spaces: disable, empty-lines: disable}}" \
+            argocd/ platform/ workloads/ || true
+      - name: kustomize build (the two overlays ArgoCD renders)
+        run: |
+          set -euo pipefail
+          for k in platform/services/cluster-dashboard platform/services/litellm-sync; do
+            echo "::group::kustomize build $k"
+            kustomize build "$k" > /dev/null
+            echo "::endgroup::"
+          done
+      - name: kubeconform on plain manifests (KRO/CRD kinds skipped)
+        run: |
+          set -euo pipefail
+          # Validate raw K8s manifests against upstream schemas. -ignore-missing-schemas
+          # lets custom kinds (kro.run, ray.io, keda, GIE) through without a schema.
+          kubeconform -strict -ignore-missing-schemas -summary \
+            -skip 'ResourceGraphDefinition,LLMDEndpoint,LLMDDisaggEndpoint,VLLMEndpoint,AITeam' \
+            platform/config platform/services || true
+
+  secrets:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"

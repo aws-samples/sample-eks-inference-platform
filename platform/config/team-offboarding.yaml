@@ -1,0 +1,130 @@
+# Team offboarding (deprovisioning) — reconciling garbage collector.
+#
+# When an AITeam is removed (git delete -> ArgoCD prune -> CR deleted), KRO
+# garbage-collects the Kubernetes resources it owns (namespace, quota, RBAC,
+# secret, ...). But the LiteLLM team + API keys are created out-of-band via the
+# LiteLLM API in the onboarding Job, so they are NOT KRO-owned and would
+# otherwise orphan in LiteLLM's DB — budget and keys living on forever.
+#
+# KRO has no pre-delete/finalizer hook to run a cleanup Job on CR deletion, so
+# instead this CronJob reconciles state: it revokes any LiteLLM team labelled
+# managed_by=kro whose team_alias no longer has a matching AITeam CR. This is
+# self-healing (also cleans up after failed onboards) and GitOps-native.
+#
+# Safety: it only ever touches teams with metadata.managed_by=kro, and it aborts
+# (set -euo pipefail) before any deletion if it cannot list AITeams or reach
+# LiteLLM — so it never revokes based on incomplete data.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: team-offboarding
+  namespace: ai-platform
+  labels:
+    app.kubernetes.io/part-of: ai-platform
+    ai-platform/managed-by: platform-team
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: team-offboarding-reader
+  labels:
+    app.kubernetes.io/part-of: ai-platform
+    ai-platform/managed-by: platform-team
+rules:
+  # Read AITeam CRs cluster-wide to determine which teams still exist.
+  - apiGroups: ["kro.run"]
+    resources: ["aiteams"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: team-offboarding-reader
+  labels:
+    app.kubernetes.io/part-of: ai-platform
+    ai-platform/managed-by: platform-team
+subjects:
+  - kind: ServiceAccount
+    name: team-offboarding
+    namespace: ai-platform
+roleRef:
+  kind: ClusterRole
+  name: team-offboarding-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: team-offboarding
+  namespace: ai-platform
+  labels:
+    app.kubernetes.io/part-of: ai-platform
+    ai-platform/managed-by: platform-team
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 600
+      template:
+        metadata:
+          labels:
+            ai-platform/job: offboarding
+        spec:
+          restartPolicy: Never
+          serviceAccountName: team-offboarding
+          containers:
+            - name: offboard
+              image: alpine/k8s:1.35.6
+              command: ["bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  LITELLM="http://litellm.ai-platform.svc.cluster.local:4000"
+
+                  echo "Waiting for LiteLLM..."
+                  until curl -sf "$LITELLM/health/liveliness" > /dev/null 2>&1; do sleep 5; done
+
+                  # Aliases of all live AITeam CRs (spec.teamName). If this query
+                  # fails, set -e aborts BEFORE any deletion — never revoke on
+                  # incomplete data. Empty (no AITeams) is a valid result: every
+                  # kro-managed LiteLLM team is then genuinely orphaned.
+                  LIVE="$(kubectl get aiteams.kro.run -A -o jsonpath='{range .items[*]}{.spec.teamName}{"\n"}{end}')"
+                  echo "Live AITeam aliases:"; printf '%s\n' "$LIVE" | sed 's/^/  - /'
+
+                  # Revoke kro-managed LiteLLM teams with no matching AITeam CR.
+                  # pipefail makes a failed /team/list abort the run (safe).
+                  curl -sf "$LITELLM/team/list" -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+                    | jq -r '.[] | select((.metadata.managed_by // "") == "kro") | [.team_alias, .team_id] | @tsv' \
+                    | while IFS="$(printf '\t')" read -r alias tid; do
+                        [ -n "$tid" ] || continue
+                        if printf '%s\n' "$LIVE" | grep -qxF "$alias"; then
+                          echo "keep: $alias ($tid)"
+                        else
+                          echo "OFFBOARD orphaned team: $alias ($tid) — no AITeam CR"
+                          curl -sf -X POST "$LITELLM/team/delete" \
+                            -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+                            -H "Content-Type: application/json" \
+                            -d "$(jq -n --arg id "$tid" '{team_ids:[$id]}')" > /dev/null \
+                            && echo "  ✓ revoked team + keys" \
+                            || echo "  ⚠ /team/delete failed for $tid"
+                        fi
+                      done
+                  echo "Offboarding reconcile complete."
+              env:
+                - name: LITELLM_MASTER_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: litellm-secrets
+                      key: master-key
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi

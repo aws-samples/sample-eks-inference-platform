@@ -1,0 +1,53 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The cluster-dashboard app bundles TWO things that share the ai-platform namespace:
+#   1. The dashboard itself (manifests.yaml: Deployment/Service/Ingress/RBAC +
+#      the cluster-topology.html and backend.py ConfigMaps).
+#   2. The Platform Health Agent (pha-*.yaml): event-watcher Deployment, RBAC,
+#      config, and the scripts ConfigMap. The agent is always synced but idles
+#      gracefully unless a Kiro API key Secret (platform-health-agent-secrets,
+#      created manually with kubectl — see PLATFORM-HEALTH-AGENT.md) is
+#      present — see pha-event-watcher.yaml + scripts/event_watcher.py.
+resources:
+  - manifests.yaml
+  - oauth2-proxy.yaml
+  - pha-rbac.yaml
+  - pha-config.yaml
+  - pha-event-watcher.yaml
+
+# The HTML doesn't change often → no hash suffix → updated in place.
+# The backend.py changes more often (especially during platform-health-agent
+# integration) → hash suffix → automatic pod restart on change.
+configMapGenerator:
+  - name: cluster-dashboard-html
+    namespace: ai-platform
+    options:
+      disableNameSuffixHash: true
+    files:
+      - cluster-topology.html
+  - name: cluster-dashboard-backend
+    namespace: ai-platform
+    # Hash suffix ENABLED (kustomize default): backend.py is loaded once at
+    # process start, so a content change must produce a new ConfigMap name →
+    # new Deployment template → automatic pod restart. Without this the pod
+    # keeps running stale code (e.g. a route the freshly-served HTML calls 404s).
+    files:
+      - scripts/backend.py
+  # Platform Health Agent scripts. Mounted by the event-watcher AND by every
+  # Investigator/Remediator Job (the Job specs in event_watcher.py / backend.py
+  # reference this ConfigMap by HARDCODED name) → keep the name stable, no hash.
+  # Trade-off: the watcher doesn't auto-restart on script changes — use
+  # `kubectl rollout restart deployment event-watcher -n ai-platform`.
+  - name: platform-health-agent-scripts
+    namespace: ai-platform
+    options:
+      disableNameSuffixHash: true
+    files:
+      - scripts/event_watcher.py
+      - scripts/investigate.sh
+      - scripts/remediate.sh
+      - scripts/persist_findings.py
+      - scripts/fix_command_policy.py
+      - scripts/db_init.sh
+      - scripts/ddl.sql

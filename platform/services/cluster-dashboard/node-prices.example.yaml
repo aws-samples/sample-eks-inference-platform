@@ -1,0 +1,34 @@
+# Optional node-price override for the cluster dashboard's cost estimate.
+#
+# The dashboard ships with on-demand prices for eu-central-1 only. In any other
+# account/region, nodes whose instance type has no price show up as "unpriced"
+# in the Cost view (honest, never guessed). To get an accurate estimate there,
+# create this ConfigMap in the ai-platform namespace — the backend merges it
+# over the shipped defaults (refreshed hourly, no restart needed).
+#
+#   kubectl apply -f node-prices.example.yaml   # after editing for your region
+#
+# Format: data['prices.json'] is a JSON object of
+#   { "<region>": { "<instance-type>": <on-demand USD/hour>, ... }, ... }
+# Spot nodes are derived automatically (~0.35x on-demand); list on-demand only.
+# Prices come from the AWS Price List (EC2, Linux, shared tenancy) for your region.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-dashboard-node-prices
+  namespace: ai-platform
+data:
+  prices.json: |
+    {
+      "us-east-1": {
+        "g6.xlarge": 0.8048, "g6.2xlarge": 0.9776, "g6.4xlarge": 1.3232,
+        "g6.12xlarge": 4.6016, "g6.48xlarge": 13.3517,
+        "g5.xlarge": 1.006, "g5.2xlarge": 1.212, "g5.12xlarge": 5.672,
+        "c7i.large": 0.08925, "c7i.xlarge": 0.1785,
+        "m7i.large": 0.1008, "m7i.xlarge": 0.2016, "m6g.large": 0.077
+      },
+      "us-west-2": {
+        "g6.xlarge": 0.8048, "g6.2xlarge": 0.9776, "g6.12xlarge": 4.6016,
+        "c7i.large": 0.08925, "m7i.large": 0.1008
+      }
+    }

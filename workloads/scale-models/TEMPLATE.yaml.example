@@ -1,0 +1,35 @@
+# LLMDEndpoint Template — scale-tier serving via llm-d.
+# Copy this file, rename it to your model name (e.g. qwen3-32b.yaml), and fill in spec.model.
+# Only 'model' is required — everything else has sensible defaults.
+#
+# Use this instead of VLLMEndpoint when you need high-throughput
+# or long multi-turn/agentic serving: llm-d spreads requests across replicas using
+# live KV-cache, prefix-reuse, and queue-depth signals (Endpoint Picker), all still
+# behind the same LiteLLM /v1 API.
+# For independent prefill/decode scaling, use LLMDDisaggEndpoint (DISAGG-TEMPLATE).
+#
+# The llm-d substrate (GIE CRDs + the llm-d OCI Helm repo registered in ArgoCD)
+# ships on every cluster via the `inference-gateway` platform app — no toggle.
+#
+# After committing, ArgoCD syncs automatically. Track progress with:
+#   kubectl get llmdendpoints -n inference -w
+#   kubectl get application <name>-llmd-router -n argocd    # the router (EPP+InferencePool)
+apiVersion: kro.run/v1alpha1
+kind: LLMDEndpoint
+metadata:
+  name: my-scale-model        # Also becomes the LiteLLM model name for API calls
+  namespace: inference
+spec:
+  model: "org/model-id"       # REQUIRED — HuggingFace model ID (e.g. Qwen/Qwen3-32B)
+  # replicas: 2               # vLLM replicas the EPP routes across (scale tier → 2+)
+  # gpuCount: 1               # GPUs per replica (tensor parallelism). 1, 2, 4, or 8.
+  # tensorParallelSize: 0     # 0 = use gpuCount; set explicitly to override
+  # maxModelLen: 8192         # Max sequence length. Lower = less GPU memory.
+  # minVramPerGpuGiB: 0       # Min per-GPU VRAM in GiB (Karpenter hint). 0 = no floor.
+  # workerMemory: "16Gi"      # Memory per replica
+  # workerCpu: "8"            # CPU per replica
+  # vllmImage: "vllm/vllm-openai:v0.24.0"      # Override only if needed
+  # routerChartVersion: "v0.9.0"               # llm-d-router-standalone chart version
+#
+# Unsure what size GPU / how many GPUs your model needs?
+# Run: ./platformctl new-model org/model-id --seq 8192 --users 4

@@ -1,0 +1,212 @@
+# VLLMEndpoint — direct vLLM serving (no Ray).
+#
+# The simple default serving tier: a model on a plain vLLM OpenAI-server
+# Deployment fronted by LiteLLM (litellm-sync registers the model; LiteLLM
+# round-robins the Service's replicas). For horizontal scale + KV-cache/prefix/
+# load-aware routing, use the llm-d tier (LLMDEndpoint / LLMDDisaggEndpoint).
+#
+# Single-mode RGD by design: KRO status fields may only reference resource
+# *outputs* (never schema) and cannot reference includeWhen-gated resources, so
+# a dual-mode RGD whose serving resource is conditional couldn't build its
+# status schema. One RGD per serving tier is the KRO-idiomatic approach.
+#
+# MIGRATION: `replicas` replaced the earlier `minReplicas`/`maxReplicas` — the
+# vLLM tier is fixed-size (no built-in autoscaler; autoscaling is the llm-d
+# tier's job). Removing CRD properties is a breaking change KRO refuses to
+# apply in place, so on upgrade recreate the CRD once — safe, it holds no
+# persistent state: `kubectl delete crd vllmendpoints.kro.run` (do it when no
+# VLLMEndpoints are live; KRO immediately rebuilds it from this RGD).
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: vllm-endpoint
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: VLLMEndpoint
+    spec:
+      model:                "string"
+      gpuCount:             "integer | default=1"
+      tensorParallelSize:   "integer | default=0"
+      pipelineParallelSize: "integer | default=1"
+      shared:               "boolean | default=false"
+      replicas:             "integer | default=1"
+      workerMemory:         "string  | default=12Gi"
+      workerCpu:            "string  | default=4"
+      maxModelLen:          "integer | default=8192"
+      minVramPerGpuGiB:     "integer | default=0"
+      vllmImage:            "string  | default=vllm/vllm-openai:v0.24.0"
+      # Optional tool/function calling. When set, the server starts with
+      # `--enable-auto-tool-choice --tool-call-parser <name>`. The parser is
+      # model-family-specific (e.g. gemma4_engine, llama4_pythonic, hermes,
+      # mistral); `platformctl new-model` auto-fills it from the model's
+      # architecture. Leave empty for chat-only models.
+      toolCallParser:       "string"
+      # Escape hatch: extra raw flags appended verbatim to `vllm serve`
+      # (quantization, dtype, kv-cache, etc.). Advanced use — most models need
+      # nothing here.
+      extraArgs:            "[]string"
+    status:
+      ready:             "${vllmdeployment.status.?availableReplicas.orValue(0) > 0 ? 'True' : 'False'}"
+      availableReplicas: ${vllmdeployment.status.?availableReplicas.orValue(0)}
+      endpoint:          "${vllmservice.metadata.name}.${vllmservice.metadata.namespace}.svc.cluster.local:8000"
+
+  resources:
+    - id: platformConfig
+      externalRef:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: platform-config
+
+    - id: vllmservice
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${schema.metadata.name}-vllm
+          labels:
+            app.kubernetes.io/name: ${schema.metadata.name}
+            ai-platform/serving-mode: vllm
+        spec:
+          selector:
+            app.kubernetes.io/name: ${schema.metadata.name}
+            ai-platform/serving-mode: vllm
+          ports:
+            - name: http
+              port: 8000
+              targetPort: 8000
+
+    - id: vllmdeployment
+      readyWhen:
+        - ${vllmdeployment.status.?availableReplicas.orValue(0) > 0}
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${schema.metadata.name}-vllm
+          labels:
+            app.kubernetes.io/name: ${schema.metadata.name}
+            ai-platform/serving-mode: vllm
+        spec:
+          replicas: ${schema.spec.replicas}
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: ${schema.metadata.name}
+              ai-platform/serving-mode: vllm
+          template:
+            metadata:
+              labels:
+                app.kubernetes.io/name: ${schema.metadata.name}
+                ai-platform/serving-mode: vllm
+              annotations:
+                karpenter.sh/do-not-disrupt: "true"
+            spec:
+              serviceAccountName: inference-worker
+              nodeSelector:
+                workload-type: "${schema.spec.shared ? 'gpu-shared' : 'gpu-inference'}"
+              tolerations:
+                - key: nvidia.com/gpu
+                  operator: Exists
+                  effect: NoSchedule
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - key: karpenter.k8s.aws/instance-gpu-memory
+                            operator: Gt
+                            values:
+                              - "${string(schema.spec.minVramPerGpuGiB > 0 ? ((schema.spec.minVramPerGpuGiB - 1) * 1024) - 1 : 0)}"
+              initContainers:
+                - name: hf-cache-download
+                  image: peakcom/s5cmd:v2.3.0
+                  env:
+                    - name: MODEL_ID
+                      value: ${schema.spec.model}
+                    - name: CACHE_BUCKET
+                      value: ${platformConfig.data.?modelCacheBucket.orValue("")}
+                    - name: AWS_REGION
+                      value: ${platformConfig.data.?region.orValue("us-east-1")}
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      set -u
+                      if [ -z "$CACHE_BUCKET" ]; then
+                        echo "modelCacheBucket not configured — vLLM will download from HF."
+                        exit 0
+                      fi
+                      PREFIX="hf/$MODEL_ID"
+                      LOCAL="/hf-cache/hub/models--$(echo "$MODEL_ID" | sed 's#/#--#g')"
+                      if /s5cmd ls "s3://$CACHE_BUCKET/$PREFIX/" >/dev/null 2>&1; then
+                        echo "Cache hit — syncing to $LOCAL"
+                        mkdir -p "$LOCAL"
+                        /s5cmd sync "s3://$CACHE_BUCKET/$PREFIX/*" "$LOCAL/" || { echo "Partial sync — wiping"; rm -rf "$LOCAL"; }
+                      else
+                        echo "Cache miss for $MODEL_ID — vLLM will download from HF."
+                      fi
+                  volumeMounts:
+                    - name: hf-cache
+                      mountPath: /hf-cache
+              containers:
+                - name: vllm
+                  image: ${platformConfig.data.?vllmImage.orValue(schema.spec.vllmImage)}
+                  command: ["vllm", "serve"]
+                  # Base flags, then (optionally) tool calling and any extra
+                  # flags. Built as a single CEL list so the optional parts
+                  # append cleanly — an empty toolCallParser / extraArgs adds
+                  # nothing, so existing endpoints are unaffected.
+                  args: >-
+                    ${[schema.spec.model,
+                       "--served-model-name", schema.spec.model,
+                       "--tensor-parallel-size", string(schema.spec.tensorParallelSize > 0 ? schema.spec.tensorParallelSize : schema.spec.gpuCount),
+                       "--pipeline-parallel-size", string(schema.spec.pipelineParallelSize),
+                       "--max-model-len", string(schema.spec.maxModelLen),
+                       "--gpu-memory-utilization", "0.9",
+                       "--port", "8000"]
+                    + (schema.spec.?toolCallParser.orValue("") != "" ? ["--enable-auto-tool-choice", "--tool-call-parser", schema.spec.?toolCallParser.orValue("")] : [])
+                    + schema.spec.?extraArgs.orValue([])}
+                  env:
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                    - name: HF_HOME
+                      value: /hf-cache
+                    - name: HF_HUB_ENABLE_HF_TRANSFER
+                      value: "1"
+                  ports:
+                    - name: http
+                      containerPort: 8000
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                    failureThreshold: 80
+                  resources:
+                    requests:
+                      cpu: ${schema.spec.workerCpu}
+                      memory: ${schema.spec.workerMemory}
+                      nvidia.com/gpu: ${schema.spec.gpuCount}
+                    limits:
+                      cpu: ${schema.spec.workerCpu}
+                      memory: ${schema.spec.workerMemory}
+                      nvidia.com/gpu: ${schema.spec.gpuCount}
+                  volumeMounts:
+                    - name: hf-cache
+                      mountPath: /hf-cache
+                    - name: shm
+                      mountPath: /dev/shm
+              volumes:
+                - name: hf-cache
+                  emptyDir:
+                    sizeLimit: 100Gi
+                - name: shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 8Gi

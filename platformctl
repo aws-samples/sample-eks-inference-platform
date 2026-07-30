@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+# platformctl — the single entry point for operating the AI platform.
+#
+# Usage:
+#   ./platformctl use     <ENV>        Switch the active env: record it, point kubectl at its cluster, pin its region
+#   ./platformctl up      [ENV]        Provision everything (state backend + all Terraform stages)
+#   ./platformctl status  [ENV] [--check]  Show health + where the UIs are reachable; --check validates end-to-end
+#   ./platformctl tunnel  [ENV]        Reach the private UIs locally (SSM port-forward to the ClusterIPs)
+#   ./platformctl edge    [MODE] [ENV] Choose the public front door: cloudfront | domain | tunnel
+#   ./platformctl new-model MODEL [..] Right-size a model + scaffold its serving YAML (VLLMEndpoint/LLMDEndpoint)
+#   ./platformctl down    [ENV] [--purge]  Tear down infra; --purge also deletes the env definition (tfvars + workspaces)
+#   ./platformctl list-envs            List configured environments (cluster + region; marks the active one)
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TF_DIR="${REPO_ROOT}/terraform"
+LIB_DIR="${REPO_ROOT}/ops/lib"
+CLUSTER_STAGE="30.eks/30.cluster"
+NS_PLATFORM="ai-platform"
+# Single source of truth for the active env (the operator's intent). The
+# Terraform workspace + kubectl context are treated as downstream and only
+# warned against, never used as the truth. Per-checkout, gitignored.
+STATE_DIR="${REPO_ROOT}/.platformctl"
+ACTIVE_ENV_FILE="${STATE_DIR}/active-env"
+
+# UI -> local tunnel port (matches ops/lib/tunnel.sh and the ALB listener ports).
+UI_PORTS=("Open WebUI:8080" "LiteLLM:4000" "Langfuse:3000" "Dashboard:9090")
+
+c_bold=$'\033[1m'; c_dim=$'\033[2m'; c_grn=$'\033[32m'; c_red=$'\033[31m'; c_ylw=$'\033[33m'; c_rst=$'\033[0m'
+[ -t 1 ] || { c_bold=""; c_dim=""; c_grn=""; c_red=""; c_ylw=""; c_rst=""; }
+
+log()  { echo "${c_bold}==>${c_rst} $*"; }
+ok()   { echo "${c_grn}✓${c_rst} $*"; }
+warn() { echo "${c_ylw}!${c_rst} $*" >&2; }
+die()  { echo "${c_red}✗${c_rst} $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required tool: $1"; }
+
+# Print the leading comment block as usage.
+usage() { sed -n '2,/^[^#]/p' "${BASH_SOURCE[0]}" | grep '^#' | sed 's/^# \{0,1\}//'; }
+
+require_tfvars() {
+  local env="$1" f="${TF_DIR}/00.global/vars/${1}.tfvars"
+  [ -f "$f" ] || die "no tfvars for env '${env}': ${f}
+  Copy 00.global/vars/example.tfvars and set your Identity Center ARN + gitops_repo_url."
+}
+
+# Fail fast if the tfvars still contains example placeholders (a common forker
+# mistake that otherwise surfaces as a cryptic error deep in the cluster apply,
+# after the cluster is already created). Strips comments first so the commented
+# example lines don't false-positive.
+check_tfvars_filled() {
+  local env="$1"
+  local f="${TF_DIR}/00.global/vars/${env}.tfvars" hits
+  hits=$(sed 's/#.*//' "$f" 2>/dev/null | grep -nE 'XXXXXXXXXX|YOUR-ORG|YOUR-REPO|REPLACE-WITH' || true)
+  [ -z "$hits" ] || die "'${env}.tfvars' still has unfilled example placeholders — set the real values first:
+${hits}
+  (e.g. Identity Center ARN + region, gitops_repo_url, seed SSO user/group ids)."
+}
+
+# Resolve the target env WITHOUT ever guessing. Order: explicit arg >
+# $PLATFORM_ENV (one-shot) > the active-env state file (set by `use`) > the
+# cluster stage's Terraform workspace (migration fallback). Empty => unresolved.
+resolve_env() {
+  local explicit="${1:-}"
+  if [ -n "$explicit" ]; then echo "$explicit"; return 0; fi
+  if [ -n "${PLATFORM_ENV:-}" ]; then echo "$PLATFORM_ENV"; return 0; fi
+  if [ -s "$ACTIVE_ENV_FILE" ]; then head -1 "$ACTIVE_ENV_FILE"; return 0; fi
+  local ws
+  ws=$(cat "${TF_DIR}/${CLUSTER_STAGE}/.terraform/environment" 2>/dev/null || true)
+  [ -n "$ws" ] && [ "$ws" != "default" ] && { echo "$ws"; return 0; }
+  return 1
+}
+
+# Read scalars from an env's tfvars. region is top-level; resources_prefix is
+# nested in shared_config (grep by exact key name; both are simple "..." values).
+tfvar_region() { grep -E '^[[:space:]]*region[[:space:]]*=' "${TF_DIR}/00.global/vars/${1}.tfvars" 2>/dev/null | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/' || true; }
+tfvar_prefix() { grep -E '^[[:space:]]*resources_prefix[[:space:]]*=' "${TF_DIR}/00.global/vars/${1}.tfvars" 2>/dev/null | head -1 | sed -E 's/^[^"]*"([^"]*)".*/\1/' || true; }
+# Cluster name convention (locals.tf: "${resources_prefix}-${workspace}").
+cluster_of() { local p; p="$(tfvar_prefix "$1")"; echo "${p:+${p}-}$1"; }
+
+# Pin AWS_REGION from the env's tfvars so make + Terraform (via data.aws_region)
+# + kubeconfig all target the same region instead of ambient AWS config.
+pin_region() { local r; r="$(tfvar_region "${1}")"; [ -n "$r" ] && export AWS_REGION="$r" || true; }
+
+# Warn (never switch — safest) when the current kubectl context is not the
+# resolved env's cluster. status/tunnel act on the CURRENT context.
+warn_context_mismatch() {
+  local env; env="$(resolve_env "${1:-}" 2>/dev/null || true)"
+  [ -n "$env" ] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+  local want cur; want="$(cluster_of "$env")"
+  cur="$(kubectl config view --minify -o jsonpath='{.clusters[0].name}' 2>/dev/null | awk -F/ '{print $NF}')"
+  [ -n "$cur" ] || return 0
+  [ "$cur" = "$want" ] && return 0
+  warn "active env is '${env}' (cluster ${want}) but the kubectl context points at '${cur}'.
+  status/tunnel act on the CURRENT context — align them with: ./platformctl use ${env}"
+}
+
+need_env() {
+  local env; env=$(resolve_env "${1:-}") || die "cannot determine the environment.
+  Pass it explicitly (e.g. '$2 <env>') or set PLATFORM_ENV=<env>."
+  echo "$env"
+}
+
+# True if a TCP listener is up on localhost:<port> (detects an active tunnel).
+port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# Print the live CloudFront edge URLs (empty if none), env-agnostic — reads the
+# real distributions so it reflects what's actually deployed, not just config.
+edge_urls_live() {
+  aws cloudfront list-distributions \
+    --query "DistributionList.Items[?starts_with(Comment,'ai-platform ')].[Comment,DomainName,Status]" \
+    --output text 2>/dev/null \
+    | awk -F'\t' 'NF{sub(/^ai-platform /,"",$1); printf "    %-11s https://%s  [%s]\n",$1,$2,$3}'
+}
+
+# ---- up / down ------------------------------------------------------------- #
+
+cmd_up() {
+  local env; env=$(need_env "${1:-}" "up")
+  need terraform; need aws; need make; require_tfvars "$env"; check_tfvars_filled "$env"; pin_region "$env"
+  log "Provisioning '${env}' — EKS + capabilities + Karpenter (takes a while)"
+  make -C "$TF_DIR" bootstrap ENVIRONMENT="$env"
+  make -C "$TF_DIR" apply-all ENVIRONMENT="$env"
+  echo
+  ok "Done. Next:"
+  echo "  ./platformctl status --check     # confirm it's healthy AND working"
+  echo "  ./platformctl tunnel             # reach the UIs locally"
+  echo "  ./platformctl edge               # (optional) choose a public front door"
+}
+
+# Remove the orphans Terraform doesn't manage (controller security groups,
+# Karpenter instances/fleets/launch-templates/instance-profiles, the EKS KMS key
+# + log groups, stray ENIs/EBS/EIPs/NAT). Env-scoped to the cluster so it can't
+# touch other environments. Best-effort — never fatal to the teardown.
+_postdown_sweep() {
+  command -v python3 >/dev/null 2>&1 && command -v aws >/dev/null 2>&1 || { warn "python3/aws unavailable — skipping orphan sweep."; return 0; }
+  local region; region="${AWS_REGION:-$(aws configure get region 2>/dev/null)}"
+  python3 "${LIB_DIR}/sweep_env.py" --env "$1" --cluster "$(cluster_of "$1")" --region "$region" || true
+}
+
+# Remove an env's DEFINITION after its infra is destroyed: the per-stage
+# Terraform workspaces (delete refuses non-empty state, so it never orphans
+# resources), the tfvars file, and the active-env pointer if it names this env.
+# Best-effort — never fatal.
+purge_env_definition() {
+  local env="$1"
+  local f="${TF_DIR}/00.global/vars/${env}.tfvars" stage d
+  log "Purging the '${env}' env definition (Terraform workspaces + tfvars)"
+  for stage in $(cd "$TF_DIR" && find . -name backend.tf -not -path '*/.terraform/*' -exec dirname {} \; | sort); do
+    d="${TF_DIR}/${stage#./}"
+    terraform -chdir="$d" workspace select default >/dev/null 2>&1 || true
+    if terraform -chdir="$d" workspace delete "$env" >/dev/null 2>&1; then
+      ok "workspace '${env}' deleted in ${stage#./}"
+    fi
+  done
+  [ -f "$f" ] && { rm -f "$f" && ok "removed ${f#"$REPO_ROOT"/}"; }
+  if [ -s "$ACTIVE_ENV_FILE" ] && [ "$(head -1 "$ACTIVE_ENV_FILE")" = "$env" ]; then
+    rm -f "$ACTIVE_ENV_FILE"; ok "cleared active-env pointer (was '${env}')"
+  fi
+}
+
+# Before Terraform runs, delete the in-cluster objects whose controllers create
+# AWS resources Terraform does NOT manage — chiefly the Ingresses, which the AWS
+# Load Balancer Controller turns into an ALB that holds the frontend security
+# group. If that ALB is still there when Terraform deletes the SG, destroy fails
+# with a DependencyViolation. Delete the ArgoCD sources first (so they can't
+# recreate anything), then the Ingresses, and WAIT for the controller to finish
+# removing the ALB (it keeps an Ingress finalizer until the ALB is gone).
+# Best-effort: if the cluster is unreachable, warn and continue.
+_predown_drain() {
+  local env="$1" cluster; cluster="$(cluster_of "$env")"
+  command -v kubectl >/dev/null 2>&1 || { warn "kubectl not found — skipping in-cluster drain (destroy may fail on the ALB security group)."; return 0; }
+  command -v aws >/dev/null 2>&1 && aws eks update-kubeconfig --name "$cluster" --region "${AWS_REGION:-}" --alias "$env" >/dev/null 2>&1 || true
+  if ! kubectl --context "$env" get namespace argocd >/dev/null 2>&1; then
+    warn "cluster '${cluster}' not reachable — skipping in-cluster drain (Terraform will destroy what it can; sweep orphans afterward)."
+    return 0
+  fi
+  log "Draining in-cluster resources so their controllers release AWS resources (ALB, etc.)…"
+  kubectl --context "$env" delete applicationset --all -n argocd --wait=false >/dev/null 2>&1 || true
+  kubectl --context "$env" delete application --all -n argocd --wait=false >/dev/null 2>&1 || true
+  kubectl --context "$env" delete vllmendpoints,llmdendpoints,llmddisaggendpoints,aiteams --all -A --wait=false >/dev/null 2>&1 || true
+  kubectl --context "$env" delete ingress --all -A --wait=false >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    [ -z "$(kubectl --context "$env" get ingress -A --no-headers 2>/dev/null)" ] && { ok "Ingresses cleared — the ALB has been released."; return 0; }
+    sleep 6
+  done
+  warn "Ingresses still terminating after 3 min — the ALB controller is likely already gone. Stripping the stuck load-balancer finalizers so the namespace can terminate during destroy…"
+  local r
+  for r in $(kubectl --context "$env" get ingress,targetgroupbindings -n "$NS_PLATFORM" -o name 2>/dev/null); do
+    kubectl --context "$env" patch -n "$NS_PLATFORM" "$r" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+  done
+}
+
+cmd_down() {
+  local purge=0 envarg="" a
+  for a in "$@"; do
+    case "$a" in --purge) purge=1 ;; *) envarg="$a" ;; esac
+  done
+  local env; env=$(need_env "$envarg" "down")
+  need terraform; need make; require_tfvars "$env"; pin_region "$env"
+  if [ "$purge" -eq 1 ]; then
+    warn "This DESTROYS all infrastructure for env '${env}' AND removes its definition (tfvars + Terraform workspaces)."
+  else
+    warn "This DESTROYS all infrastructure for env '${env}'."
+  fi
+  read -r -p "Type the environment name ('${env}') to confirm: " confirm
+  [ "$confirm" = "$env" ] || die "confirmation mismatch — aborted (nothing changed)."
+  # The CloudFront edge's data.aws_lb lookup fails once the ALB is drained (next
+  # step), so disable the edge in the tfvars first: Terraform then drops the edge
+  # resources + that data source from the destroy plan and clears them from state.
+  _edge_set_tfvar "$env" false
+  _predown_drain "$env"
+  if ! make -C "$TF_DIR" destroy-all ENVIRONMENT="$env"; then
+    warn "Terraform destroy hit leftover dependencies — sweeping orphans and retrying once."
+    _postdown_sweep "$env"
+    make -C "$TF_DIR" destroy-all ENVIRONMENT="$env" || warn "destroy still failing after the sweep — inspect the error above; re-running './platformctl down ${env}' is safe (idempotent)."
+  fi
+  # Final sweep: clear post-destroy orphans Terraform never manages so nothing
+  # lingers billing (Karpenter instance-profiles, EKS KMS key + log groups, etc.).
+  _postdown_sweep "$env"
+  [ "$purge" -eq 1 ] && purge_env_definition "$env"
+  true
+}
+
+# ---- status [--check] ------------------------------------------------------ #
+
+cmd_status() {
+  need kubectl
+  local deep=0 env="" a
+  for a in "$@"; do
+    case "$a" in --check) deep=1 ;; *) env="$a" ;; esac
+  done
+  warn_context_mismatch "$env"
+
+  log "ArgoCD applications"
+  kubectl get applications -n argocd 2>/dev/null \
+    || warn "cannot reach the cluster — run: aws eks update-kubeconfig --name <cluster>"
+  echo
+  log "Platform pods (${NS_PLATFORM})"
+  kubectl get pods -n "$NS_PLATFORM" 2>/dev/null || true
+  echo
+  log "Serving endpoints (all namespaces)"
+  kubectl get vllmendpoints,llmdendpoints,llmddisaggendpoints -A 2>/dev/null || echo "  (none deployed)"
+
+  echo
+  _status_access
+
+  [ "$deep" -eq 1 ] || { echo; echo "${c_dim}Run 'platformctl status --check' to validate Bedrock + gateway + tracing.${c_rst}"; return; }
+  echo
+  _status_check
+}
+
+# Where are the UIs reachable? Shows the edge posture, live public URLs, and
+# whether a local tunnel is currently up.
+_status_access() {
+  log "Access — where the UIs are reachable"
+  local shown=0
+
+  # 1) CloudFront edge (public HTTPS). Read the live distributions.
+  local cf=""
+  command -v aws >/dev/null 2>&1 && cf=$(edge_urls_live || true)
+  if [ -n "$cf" ]; then
+    echo "  ${c_grn}CloudFront edge${c_rst} (public HTTPS; [Deployed] = live, [InProgress] = still rolling out):"
+    echo "$cf"
+    shown=1
+  fi
+
+  # 2) Own-domain posture: the ALB is internet-facing.
+  local scheme
+  scheme=$(kubectl get ingress -n "$NS_PLATFORM" -o jsonpath='{.items[0].metadata.annotations.alb\.ingress\.kubernetes\.io/scheme}' 2>/dev/null || true)
+  if [ "$scheme" = "internet-facing" ]; then
+    local albhost
+    albhost=$(kubectl get ingress -n "$NS_PLATFORM" -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+    echo "  ${c_grn}Internet-facing ALB${c_rst} — reach the UIs at your DNS names (or ${albhost:-the ALB host}) on ports 8080/4000/3000/9090."
+    shown=1
+  fi
+
+  # 3) Local tunnel: is one currently running?
+  local any_up=0 pair name port line=""
+  for pair in "${UI_PORTS[@]}"; do
+    name="${pair%%:*}"; port="${pair##*:}"
+    if port_open "$port"; then any_up=1; line="${line}    ${name}: http://localhost:${port}\n"; fi
+  done
+  if [ "$any_up" -eq 1 ]; then
+    echo "  ${c_grn}Tunnel ACTIVE${c_rst} (this machine):"
+    printf "%b" "$line"
+    shown=1
+  else
+    echo "  ${c_dim}No tunnel running on this machine — start one: ./platformctl tunnel${c_rst}"
+  fi
+
+  # 4) Nothing public + internal ALB: make the private posture explicit.
+  if [ "$shown" -eq 0 ] && [ "$scheme" != "internet-facing" ]; then
+    echo "  ${c_dim}UIs are private (internal ALB). Go public with ./platformctl edge cloudfront, or tunnel above.${c_rst}"
+  fi
+}
+
+# Active end-to-end validation (--check).
+_status_check() {
+  log "Validating the platform end-to-end (--check)"
+  need aws
+  local mk code base="http://127.0.0.1:4000" pf_pid=""
+  mk=$(kubectl get secret litellm-secrets -n "$NS_PLATFORM" -o jsonpath='{.data.master-key}' 2>/dev/null | base64 -d) \
+    || { warn "cannot read litellm master key — is the platform up?"; return 1; }
+  kubectl port-forward -n "$NS_PLATFORM" svc/litellm 4000:4000 >/dev/null 2>&1 &
+  pf_pid=$!
+  sleep 4
+
+  if curl -fsS "$base/v1/models" -H "Authorization: Bearer $mk" >/dev/null 2>&1; then
+    ok "LiteLLM gateway responding (/v1/models)"
+  else
+    warn "LiteLLM gateway not responding"
+  fi
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/v1/chat/completions" \
+    -H "Authorization: Bearer $mk" -H "Content-Type: application/json" \
+    -d '{"model":"claude-opus-4-8","messages":[{"role":"user","content":"ping"}],"max_tokens":5}')
+  if [ "$code" = "200" ]; then
+    ok "Bedrock frontier model answered (claude-opus-4-8)"
+  else
+    warn "Bedrock model call returned HTTP $code — enable Bedrock model access in the console (per-account toggle)"
+  fi
+  if kubectl run pfcheck-langfuse --rm -i --restart=Never --image=curlimages/curl:8.11.0 -n "$NS_PLATFORM" --quiet -- \
+       -fsS http://langfuse-web.ai-platform.svc.cluster.local:3000/api/public/health >/dev/null 2>&1; then
+    ok "Langfuse tracing reachable"
+  else
+    warn "Langfuse health check failed (tracing may be starting)"
+  fi
+
+  [ -n "${pf_pid:-}" ] && kill "$pf_pid" 2>/dev/null || true
+}
+
+# ---- tunnel ---------------------------------------------------------------- #
+
+cmd_tunnel() {
+  need kubectl; need aws
+  command -v session-manager-plugin >/dev/null 2>&1 || \
+    die "missing required tool: session-manager-plugin (AWS Session Manager plugin — see README prerequisites)"
+  local env; env=$(resolve_env "${1:-}" 2>/dev/null || true)
+  [ -n "$env" ] && pin_region "$env"   # tunnel.sh queries EC2 in AWS_REGION — target the env's region
+  warn_context_mismatch "${1:-}"
+  exec "${LIB_DIR}/tunnel.sh"
+}
+
+# ---- edge ------------------------------------------------------------------ #
+
+cmd_edge() {
+  local mode="${1:-}"
+  case "$mode" in
+    cloudfront) _edge_apply cloudfront "${2:-}" ;;
+    tunnel|off) _edge_apply off "${2:-}" ;;
+    domain)     _edge_domain_help ;;
+    ""|status)  _edge_help ;;
+    *) die "unknown edge mode: ${mode}  (use: cloudfront | domain | tunnel)" ;;
+  esac
+}
+
+# Enable/disable the CloudFront edge. Guarded three ways: (1) env is resolved,
+# never guessed; (2) a typed confirmation showing the exact env; (3) the real
+# Terraform plan is shown and a second 'yes' is required before anything applies.
+# Everything runs through the Makefile so the workspace, var-file, and backend
+# are always the deployed env's (the cause of the earlier "53 to add" was a
+# guessed 'dev' env pointing at an empty workspace — now impossible).
+_edge_apply() {
+  local action="$1" env
+  need terraform; need make; need aws
+  env=$(need_env "${2:-}" "edge ${action/off/tunnel}")
+  require_tfvars "$env"; pin_region "$env"
+  local want; [ "$action" = cloudfront ] && want=true || want=false
+
+  echo
+  if [ "$action" = cloudfront ]; then
+    warn "About to ENABLE the CloudFront edge — a significant, user-facing change:"
+    echo "    • creates 4 public CloudFront distributions (BILLABLE) fronting the private ALB"
+    echo "    • exposes Open WebUI / LiteLLM / Langfuse / Dashboard on public *.cloudfront.net HTTPS"
+    echo "    • rewrites the Cognito OIDC callback URLs to those public domains"
+  else
+    warn "About to DISABLE the CloudFront edge — a significant, user-facing change:"
+    echo "    • DESTROYS the 4 CloudFront distributions + VPC origins (public URLs stop working)"
+    echo "    • reverts the Cognito callbacks; reach the UIs via ./platformctl tunnel afterwards"
+  fi
+  echo "    Environment: ${c_bold}${env}${c_rst}   (Terraform workspace: ${env})"
+  echo
+  read -r -p "Type the environment name ('${env}') to continue to the plan: " confirm
+  [ "$confirm" = "$env" ] || die "confirmation mismatch — aborted (nothing changed)."
+
+  _edge_set_tfvar "$env" "$want"
+  echo; log "Planning the change for '${env}' — review the plan below carefully:"
+  make -C "$TF_DIR" plan MODULE="$CLUSTER_STAGE" ENVIRONMENT="$env"
+  echo
+  read -r -p "Apply the plan above to '${env}'? Type 'yes' to proceed (anything else aborts): " go
+  [ "$go" = "yes" ] || die "aborted at plan review (nothing applied)."
+  make -C "$TF_DIR" apply MODULE="$CLUSTER_STAGE" ENVIRONMENT="$env"
+
+  # The apps read their public URL from a Secret/ConfigMap at startup (OIDC
+  # redirects) and the dashboard reads the edge URLs from a ConfigMap env — none
+  # hot-reload, so restart them to pick up the new URLs. Best-effort.
+  if command -v kubectl >/dev/null 2>&1; then
+    log "Restarting the UIs + dashboard to pick up the new URLs…"
+    kubectl rollout restart deployment -n "$NS_PLATFORM" \
+      open-webui litellm langfuse-web oauth2-proxy cluster-dashboard >/dev/null 2>&1 \
+      || warn "could not restart some deployments — restart them manually to apply the new URLs"
+  fi
+
+  echo
+  if [ "$action" = cloudfront ]; then
+    ok "CloudFront edge applied for '${env}'. Public URLs ([InProgress] until ~10-15 min out):"
+    edge_urls_live
+    echo "${c_dim}Cognito callbacks + the dashboard Quick Links were updated automatically. Track rollout with: ./platformctl status${c_rst}"
+  else
+    ok "CloudFront edge removed for '${env}'. Reach the UIs with: ./platformctl tunnel"
+  fi
+}
+
+_edge_domain_help() {
+  cat <<EOF
+${c_bold}Front door: your own domain on an internet-facing ALB${c_rst}
+This is a GitOps change (the ALB scheme + cert live in the ingress manifests),
+so edit + commit + push in your fork — there is no Terraform toggle:
+  1. In platform/config/ingress.yaml (x3) + platform/services/cluster-dashboard/manifests.yaml,
+     set on all four ingresses:
+       alb.ingress.kubernetes.io/scheme: internet-facing
+       alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS": <port>}]'
+       alb.ingress.kubernetes.io/certificate-arn: <your ACM cert ARN, in this region>
+     and set inbound-cidrs to your own IP/CIDR ranges (never 0.0.0.0/0).
+  2. Point your DNS (Route53 alias / CNAME) at the ALB hostname.
+  3. Put your domain URLs in sso_public_urls in your tfvars and re-apply the
+     cluster stage to wire the Cognito callbacks (a normal 'up' does this).
+EOF
+}
+
+_edge_help() {
+  cat <<EOF
+${c_bold}Public front door — three postures:${c_rst}
+  ${c_grn}tunnel${c_rst}      Private ALB, no public IP. Reach the UIs via ./platformctl tunnel. (default)
+  ${c_grn}cloudfront${c_rst}  Public HTTPS via CloudFront VPC origins to the private ALB — free
+              *.cloudfront.net cert, no domain needed. Good for demo/PoC. BILLABLE.
+              Run AFTER 'up' (needs the ALB):  ./platformctl edge cloudfront [ENV]
+  ${c_grn}domain${c_rst}      Your own domain + cert on an internet-facing ALB (enterprise).
+              Guided GitOps change:            ./platformctl edge domain
+
+  Turn CloudFront off (destroys the distributions):  ./platformctl edge tunnel [ENV]
+  See the current posture + URLs any time:           ./platformctl status
+EOF
+}
+
+# Set enable_cloudfront_edge in the env tfvars (durable), adding the line if absent.
+_edge_set_tfvar() {
+  local env="$1" val="$2" f="${TF_DIR}/00.global/vars/${1}.tfvars"
+  if grep -q '^enable_cloudfront_edge' "$f"; then
+    sed -i.bak "s/^enable_cloudfront_edge.*/enable_cloudfront_edge = ${val}/" "$f" && rm -f "${f}.bak"
+  else
+    printf '\nenable_cloudfront_edge = %s\n' "$val" >> "$f"
+  fi
+}
+
+# ---- new-model ------------------------------------------------------------- #
+
+cmd_new_model() {
+  need python3
+  [ "$#" -ge 1 ] || die "usage: platformctl new-model <hf-model-id> [flags]
+  e.g. platformctl new-model Qwen/Qwen2.5-3B-Instruct --seq 8192 --users 4"
+  exec python3 "${LIB_DIR}/recommend-instance.py" "$@"
+}
+
+# ---- use ------------------------------------------------------------------- #
+
+# Switch the active env — the single action that aligns everything: records the
+# intent in the state file (which resolve_env reads), pins the region, and points
+# kubectl at that env's cluster. The one place we deliberately touch kubeconfig.
+cmd_use() {
+  local env="${1:-}"
+  [ -n "$env" ] || die "usage: platformctl use <env>   (see: ./platformctl list-envs)"
+  require_tfvars "$env"
+  local region cluster
+  region="$(tfvar_region "$env")"
+  [ -n "$region" ] || die "env '${env}' has no 'region' in 00.global/vars/${env}.tfvars — add:  region = \"<aws-region>\""
+  cluster="$(cluster_of "$env")"
+  mkdir -p "$STATE_DIR"; printf '%s\n' "$env" > "$ACTIVE_ENV_FILE"
+  ok "Active env → ${c_bold}${env}${c_rst}  (cluster ${cluster}, region ${region})"
+  if command -v aws >/dev/null 2>&1; then
+    if aws eks update-kubeconfig --name "$cluster" --region "$region" --alias "$env" >/dev/null 2>&1; then
+      ok "kubectl context → ${env}"
+    else
+      warn "kubeconfig not updated — cluster '${cluster}' not found in ${region} (not provisioned yet?).
+  Provision it with './platformctl up ${env}', then re-run './platformctl use ${env}'."
+    fi
+  fi
+}
+
+# ---- list-envs ------------------------------------------------------------- #
+
+# List the configured environments (one per 00.global/vars/<env>.tfvars, minus
+# the example templates) with their cluster + region, and highlight the active
+# one (what verbs resolve to when [ENV] is omitted). Local files only — no AWS.
+cmd_list_envs() {
+  local vars_dir="${TF_DIR}/00.global/vars" active found=0 f env region cluster mark
+  active=$(resolve_env "" 2>/dev/null || true)
+
+  log "Environments (${vars_dir#"$REPO_ROOT"/}/<env>.tfvars)"
+  for f in "$vars_dir"/*.tfvars; do
+    [ -e "$f" ] || continue
+    env="$(basename "$f" .tfvars)"
+    case "$env" in example|example-*) continue ;; esac
+    found=1
+    region="$(tfvar_region "$env")"; cluster="$(cluster_of "$env")"
+    if [ "$env" = "$active" ]; then mark="${c_grn}●${c_rst}"; else mark=" "; fi
+    printf "  %b %-14s ${c_dim}%s  %s${c_rst}\n" "$mark" "$env" "${cluster:-?}" "${region:-<no region — add to tfvars>}"
+  done
+  [ "$found" -eq 1 ] || warn "no environments configured yet — copy ${vars_dir#"$REPO_ROOT"/}/example.tfvars to <env>.tfvars"
+
+  echo
+  if [ -n "$active" ]; then
+    local src
+    if [ -n "${PLATFORM_ENV:-}" ]; then src="\$PLATFORM_ENV"
+    elif [ -s "$ACTIVE_ENV_FILE" ]; then src="./platformctl use"
+    else src="the deployed Terraform workspace"; fi
+    echo "${c_dim}Active: '${active}' (from ${src}) — used when [ENV] is omitted. Switch with ./platformctl use <env>.${c_rst}"
+  else
+    echo "${c_dim}No active env — set one with ./platformctl use <env> (or pass [ENV] / set PLATFORM_ENV).${c_rst}"
+  fi
+}
+
+# ---- dispatch -------------------------------------------------------------- #
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    up)        cmd_up "$@" ;;
+    use)       cmd_use "$@" ;;
+    down)      cmd_down "$@" ;;
+    status)    cmd_status "$@" ;;
+    tunnel)    cmd_tunnel "$@" ;;
+    edge)      cmd_edge "$@" ;;
+    new-model) cmd_new_model "$@" ;;
+    list-envs|envs) cmd_list_envs "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "unknown command: ${cmd}
+$(usage)" ;;
+  esac
+}
+
+main "$@"

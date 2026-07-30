@@ -1,0 +1,25 @@
+# Kustomization for litellm-sync.
+#
+# ArgoCD auto-detects this file and applies via kustomize. The
+# configMapGenerator inlines scripts/litellm_sync.py into a
+# `litellm-sync-scripts` ConfigMap, mounted at /scripts.
+#
+# The hash suffix on the generated ConfigMap (default) is kept: any change to
+# the script produces a new ConfigMap name -> Deployment template change ->
+# automatic pod restart, so script edits roll out without a manual restart.
+# Safe here because only this Deployment mounts the ConfigMap (by reference,
+# not hardcoded name).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: inference
+
+resources:
+  - rbac.yaml
+  - deployment.yaml
+
+configMapGenerator:
+  - name: litellm-sync-scripts
+    namespace: inference
+    files:
+      - scripts/litellm_sync.py

@@ -1,0 +1,116 @@
+# Workloads — self-service model + team deployment (Helm-templated app-of-apps).
+#
+# The repo URL is injected ONCE by Terraform via Helm values
+# (.Values.workloadsRepoURL, defaulting to .Values.repoURL) — see
+# argocd/bootstrap/values.yaml. Point var.gitops_workloads_repo_url at a
+# separate, tenant-owned repo for multi-team self-service, so teams get write
+# access to the workloads repo ONLY, never to the platform repo. Default: the
+# platform repo itself (single-repo, simplest).
+#
+# Two ApplicationSets:
+#   workloads-models — a GIT DIRECTORY generator over `workloads/models/*/`.
+#     Each subdirectory is a TARGET NAMESPACE: the VLLMEndpoint YAMLs inside it
+#     deploy into a namespace named after the directory. Name a team's directory
+#     after its AITeam namespace (`team-<name>`) so its models land in that
+#     team's quota + RBAC + scoped key; platform-default models go in
+#     `workloads/models/inference/`. CreateNamespace is deliberately OFF — the
+#     namespace must already exist (its AITeam creates it, with quota), so a
+#     stray model commit can't spin up an unquota'd namespace.
+#   workloads — a list generator for team onboarding (AITeam -> ai-platform) and
+#     the llm-d scale / disaggregation models (-> inference).
+{{- $wr := .Values.workloadsRepoURL | default .Values.repoURL }}
+{{- $rev := .Values.revision }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: workloads-models
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - git:
+        repoURL: {{ $wr }}
+        revision: {{ $rev }}
+        directories:
+          - path: workloads/models/*
+  template:
+    metadata:
+      name: '{{`models-{{.path.basename}}`}}'
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: ai-platform
+        tier: workloads
+    spec:
+      # Restricted project (templates/projects.yaml): KRO kinds only, serving
+      # namespaces only, no cluster-scoped resources — enforces the tenant
+      # boundary that repo write access alone does not.
+      project: ai-platform-workloads
+      source:
+        repoURL: {{ $wr }}
+        targetRevision: {{ $rev }}
+        path: '{{`{{.path.path}}`}}'
+        directory:
+          recurse: true
+      destination:
+        name: local-cluster
+        # The directory name IS the target namespace (team-<name>, or inference
+        # for platform defaults). Model CRs omit metadata.namespace and inherit it.
+        namespace: '{{`{{.path.basename}}`}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          # No CreateNamespace: the target namespace must pre-exist (created by
+          # its AITeam, with quota + RBAC). Onboard the team before its models.
+          - ServerSideApply=true
+          - ServerSideDiff=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: workloads
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - list:
+        elements:
+          - name: teams
+            path: workloads/teams
+            namespace: ai-platform
+          - name: scale-models
+            path: workloads/scale-models
+            namespace: inference
+  template:
+    metadata:
+      name: '{{`{{.name}}`}}'
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: ai-platform
+        tier: workloads
+    spec:
+      # Restricted project (templates/projects.yaml): KRO kinds only, serving
+      # namespaces only, no cluster-scoped resources — enforces the tenant
+      # boundary that repo write access alone does not.
+      project: ai-platform-workloads
+      source:
+        repoURL: {{ $wr }}
+        targetRevision: {{ $rev }}
+        path: '{{`{{.path}}`}}'
+        # Recurse so ArgoCD picks up every YAML; it ignores non-manifest files
+        # (.example, .gitkeep).
+        directory:
+          recurse: true
+      destination:
+        name: local-cluster
+        namespace: '{{`{{.namespace}}`}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - ServerSideDiff=true

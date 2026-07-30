@@ -1,0 +1,107 @@
+---
+# NOTE: The three ingresses below share a single ALB via
+# `alb.ingress.kubernetes.io/group.name: ai-platform` (the cluster-dashboard
+# ingress in platform/services/cluster-dashboard/manifests.yaml joins the same
+# group — four ingresses total). ALB-level annotations (scheme, security-groups,
+# subnets, ...) must be IDENTICAL across all of them or the AWS Load Balancer
+# Controller refuses to merge. Keep every one of them in sync.
+#
+# SCHEME: internal (private ALB) — the secure default. The ALB has no public
+# IP and is unreachable from the internet. Reach the UIs two ways:
+#   * ./platformctl tunnel — kubectl port-forward straight to the pods (works
+#     regardless of ALB scheme; the everyday operator path).
+#   * The opt-in CloudFront edge (`./platformctl edge cloudfront`, built in
+#     Terraform) — public HTTPS via a CloudFront VPC origin that connects
+#     privately to this internal ALB. The supported way to expose the UIs
+#     publicly, with TLS + SSO in front.
+# To instead expose the ALB directly to the internet, flip all four `scheme`
+# values to `internet-facing` and tighten the SG below to your own IPs.
+#
+# SECURITY-GROUPS: the ALB's inbound is governed by a Terraform-managed frontend
+# SG (`ai-platform-alb-inbound`, terraform/30.eks/30.cluster/alb-security-group.tf)
+# instead of the controller's `inbound-cidrs`. WHY: the CloudFront edge reaches
+# the ALB via a VPC origin whose traffic is authorized by SECURITY-GROUP
+# REFERENCE, not the VPC CIDR — and the controller strips foreign rules from the
+# SG it auto-creates from inbound-cidrs. So we own this SG: it allows the VPC
+# CIDR (in-VPC / tunnel node) always, and `platformctl edge cloudfront` adds the
+# CloudFront VPC-origin SG to it (edge.tf). The controller still auto-manages the
+# backend SG, so ALB->pod traffic is unaffected. To change the allowed sources
+# (e.g. an internet-facing operator allowlist), edit that SG in Terraform. The SG
+# is referenced by fixed name, so it is fork-generic.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-platform-litellm
+  namespace: ai-platform
+  annotations:
+    alb.ingress.kubernetes.io/group.name: ai-platform
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 4000}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /health/liveliness
+    alb.ingress.kubernetes.io/security-groups: ai-platform-alb-inbound
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: litellm
+                port:
+                  number: 4000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-platform-openwebui
+  namespace: ai-platform
+  annotations:
+    alb.ingress.kubernetes.io/group.name: ai-platform
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 8080}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/security-groups: ai-platform-alb-inbound
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: open-webui
+                port:
+                  number: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-platform-langfuse
+  namespace: ai-platform
+  annotations:
+    alb.ingress.kubernetes.io/group.name: ai-platform
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 3000}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /api/public/health
+    alb.ingress.kubernetes.io/security-groups: ai-platform-alb-inbound
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: langfuse-web
+                port:
+                  number: 3000

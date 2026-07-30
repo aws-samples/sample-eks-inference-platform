@@ -1,0 +1,356 @@
+# Cluster Dashboard manifests.
+#
+# Two roles in V2 (after platform-health-agent integration):
+#   1. Cluster topology view (existing): polls K8s for nodes/pods/serving endpoints.
+#   2. Platform Health Agent approvals UI (new):  reads pending investigations from
+#      the `platform_health_agent` postgres database; on click, creates a Remediator
+#      Job in the `ai-platform` namespace.
+#
+# The Platform Health Agent now ships as a COMPONENT of this app — its
+# event-watcher, RBAC, config, and scripts live alongside these manifests
+# (pha-*.yaml, wired via kustomization.yaml), all in the ai-platform namespace.
+# It is always synced but idles gracefully unless a Kiro API key Secret is
+# present (see pha-event-watcher.yaml). When idle, the approvals UI auto-disables
+# (no investigations in the DB) and the topology view works unchanged.
+#
+# backend.py is generated from cluster-dashboard/scripts/backend.py by
+# kustomize (see kustomization.yaml). Image switched from python:3.12-alpine
+# to python:3.12-slim because psycopg[binary] requires glibc, not musl.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-dashboard
+  namespace: ai-platform
+---
+# Existing cluster-wide read access (topology view).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cluster-dashboard
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+  # Deployment diagnostics: pod/NodeClaim events (scheduling + Karpenter
+  # capacity failures) and pod log tails (model-loading progress).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["kro.run"]
+    resources: ["vllmendpoints", "llmdendpoints", "llmddisaggendpoints"]
+    verbs: ["list"]
+  # Autoscaling visibility: read the KEDA-managed HPAs (current/desired/min/max +
+  # the driving metric value/target) so the dashboard shows per-pool scaling.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+  # ConfigMap reads are namespaced (litellm-config / node-prices in ai-platform,
+  # by name) — granted via the cluster-dashboard-config Role below, NOT here.
+  # Keeping configmaps out of this ClusterRole stops the dashboard from reading
+  # every ConfigMap in every namespace (kube-system's aws-auth, tenant config…).
+  # Read ArgoCD Applications for the Health view's GitOps sync status.
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list"]
+  # Read the shared ALB ingress to discover its hostname for the Quick Links panel.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list"]
+  # Actual node/pod usage from metrics-server for the Infrastructure usage view.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cluster-dashboard
+subjects:
+  - kind: ServiceAccount
+    name: cluster-dashboard
+    namespace: ai-platform
+roleRef:
+  kind: ClusterRole
+  name: cluster-dashboard
+  apiGroup: rbac.authorization.k8s.io
+---
+# Namespaced ConfigMap read (ai-platform only): the dashboard fetches
+# litellm-config (Bedrock model_list) and node-prices by name from ai-platform.
+# Scoped to a Role here instead of the cluster-wide ClusterRole above so it can't
+# read ConfigMaps in other namespaces.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cluster-dashboard-config
+  namespace: ai-platform
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cluster-dashboard-config
+  namespace: ai-platform
+subjects:
+  - kind: ServiceAccount
+    name: cluster-dashboard
+    namespace: ai-platform
+roleRef:
+  kind: Role
+  name: cluster-dashboard-config
+  apiGroup: rbac.authorization.k8s.io
+---
+# NOTE: the dashboard's Job-creation rights for spawning Remediator Jobs now
+# live in pha-rbac.yaml (RoleBinding platform-health-agent-spawner-dashboard),
+# since the agent + dashboard share the ai-platform namespace. Keeping all PHA
+# RBAC in one file avoids a Role split across two manifests.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-dashboard
+  namespace: ai-platform
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cluster-dashboard
+  template:
+    metadata:
+      labels:
+        app: cluster-dashboard
+      annotations:
+        instrumentation.opentelemetry.io/inject-python: "false"
+    spec:
+      serviceAccountName: cluster-dashboard
+      automountServiceAccountToken: true
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      initContainers:
+        - name: install-pydeps
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # psycopg is optional from the backend's POV — if pip fails
+              # (e.g. air-gapped), the dashboard still serves the topology
+              # view, just without approvals.
+              pip install --no-cache-dir --target=/pydeps psycopg[binary]==3.2.3 pyyaml==6.0.2 'boto3>=1.34,<2' 'pyjwt[crypto]==2.9.0' || true
+          volumeMounts:
+            - name: pydeps
+              mountPath: /pydeps
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: backend
+          image: python:3.12-slim
+          command: ["python3", "/app/backend.py"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PYTHONPATH
+              value: /pydeps
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # platform-health-agent integration. These are SAFE to set even when the
+            # agent is not deployed — backend gracefully reports
+            # `approvals_available: false` if the DB is unreachable.
+            - name: DB_HOST
+              value: platform-db.ai-platform.svc.cluster.local
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_NAME
+              value: platform_health_agent
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: platform-db-credentials, key: username } }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: platform-db-credentials, key: password } }
+            - name: PLATFORM_HEALTH_AGENT_NAMESPACE
+              value: ai-platform
+            # --- Auth for mutating endpoints (approve/dismiss/delete) ---
+            # The backend verifies the OIDC ID token oauth2-proxy injects, so a
+            # cluster remediation can only be approved by a verified admin — on
+            # the ALB path AND the tunnel path. Issuer + client-id come from the
+            # same Terraform-managed Secret oauth2-proxy uses. optional: true so
+            # the dashboard still serves the read-only topology view if unset;
+            # when unset, mutations fail closed unless DASHBOARD_AUTH_REQUIRED is
+            # explicitly set to "false" (trusted network / SSO disabled).
+            - name: OIDC_ISSUER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secrets
+                  key: issuer
+                  optional: true
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secrets
+                  key: client-id
+                  optional: true
+            # Only these Cognito groups may APPROVE remediations (stricter than
+            # the view, which oauth2-proxy also opens to developers).
+            - name: OIDC_ALLOWED_GROUPS
+              value: "ai-platform-admins"
+            - name: DASHBOARD_AUTH_REQUIRED
+              value: "true"
+            - name: APPROVAL_EXPIRY_HOURS
+              value: "24"
+            - name: MAX_REMEDIATIONS_PER_DAY
+              value: "20"
+            # An investigation Job has a 10-min hard deadline. Past this many minutes
+            # an in-flight row is treated as stuck and becomes dismissable in the UI.
+            - name: STALE_INVESTIGATION_MINUTES
+              value: "15"
+            - name: KIRO_MODEL_REMEDIATE
+              value: "auto"
+            - name: PYTHON_IMAGE
+              value: "python:3.12-slim"
+            - name: KUBECTL_VERSION
+              value: "v1.32.5"
+            # Quick Links panel. The ALB-fronted UIs (Open WebUI / LiteLLM /
+            # Langfuse) are discovered at runtime from the ingress hostname; only
+            # ArgoCD's URL must be injected, from the Terraform-managed
+            # cluster-dashboard-links ConfigMap (the EKS capability server_url).
+            # optional: true → dashboard still works (ArgoCD link hidden) if unset.
+            - name: ARGOCD_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-dashboard-links
+                  key: argocdUrl
+                  optional: true
+            # Cluster name for the dashboard header. Set by Terraform into the
+            # same ConfigMap; optional so the header just omits it if unset.
+            # (Region is auto-detected from node labels, so it needs no env.)
+            - name: CLUSTER_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-dashboard-links
+                  key: clusterName
+                  optional: true
+            # Public UI URLs when the CloudFront edge is on (set by Terraform).
+            # The Quick Links prefer these over the internal-ALB host:port.
+            - name: OPEN_WEBUI_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-dashboard-links
+                  key: openWebuiUrl
+                  optional: true
+            - name: LITELLM_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-dashboard-links
+                  key: litellmUrl
+                  optional: true
+            - name: LANGFUSE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: cluster-dashboard-links
+                  key: langfuseUrl
+                  optional: true
+          volumeMounts:
+            - name: backend-script
+              mountPath: /app
+              readOnly: true
+            - name: html
+              mountPath: /html
+              readOnly: true
+            - name: pydeps
+              mountPath: /pydeps
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "96Mi"
+            limits:
+              cpu: "300m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /data.json
+              port: 8080
+            initialDelaySeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /data.json
+              port: 8080
+            initialDelaySeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: backend-script
+          configMap:
+            name: cluster-dashboard-backend
+        - name: html
+          configMap:
+            name: cluster-dashboard-html
+        - name: pydeps
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cluster-dashboard
+  namespace: ai-platform
+spec:
+  selector:
+    app: cluster-dashboard
+  ports:
+    - port: 9090
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ai-platform-dashboard
+  namespace: ai-platform
+  annotations:
+    alb.ingress.kubernetes.io/group.name: ai-platform
+    # scheme: internal (private ALB) — the secure default; must stay IDENTICAL
+    # to platform/config/ingress.yaml (shared ALB group "ai-platform"). Reach
+    # the UIs via ./platformctl tunnel or the opt-in CloudFront VPC-origin edge.
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 9090}]'
+    # Healthcheck hits oauth2-proxy's /ping (the ingress backend is the proxy,
+    # not the dashboard directly — see below).
+    alb.ingress.kubernetes.io/healthcheck-path: /ping
+    # ALB inbound is governed by the Terraform-managed frontend SG. These two
+    # annotations must stay IDENTICAL to platform/config/ingress.yaml (shared ALB
+    # group "ai-platform") — see that file's header for the why.
+    alb.ingress.kubernetes.io/security-groups: ai-platform-alb-inbound
+    alb.ingress.kubernetes.io/manage-backend-security-group-rules: "true"
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                # SSO gate: route through oauth2-proxy (Cognito), which
+                # authenticates + authorizes (admins/developers) and proxies to
+                # the dashboard. The dashboard has no native auth, so this is
+                # what protects it out of the box. oauth2-proxy ships in this
+                # same app (oauth2-proxy.yaml); its config comes from the
+                # Terraform-created `oauth2-proxy-secrets` (enable_sso, default on).
+                name: oauth2-proxy
+                port:
+                  number: 4180

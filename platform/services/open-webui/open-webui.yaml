@@ -1,0 +1,301 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: open-webui
+  namespace: ai-platform
+  labels:
+    app: open-webui
+  annotations:
+    # Server-side apply so ArgoCD merges the env list by field ownership rather
+    # than a strategic patch. Without this, switching an env var between `value`
+    # and `valueFrom` (e.g. the SSO OPENID_REDIRECT_URI) leaves both set on the
+    # live object and the apply fails with "may not be specified when value is
+    # not empty". SSA transitions the field cleanly.
+    argocd.argoproj.io/sync-options: ServerSideApply=true
+spec:
+  replicas: 1
+  # Recreate (not RollingUpdate): the data PVC is ReadWriteOnce, so a rolling
+  # update deadlocks — the new pod can't mount the volume the old pod still holds
+  # (Multi-Attach). Recreate terminates the old pod first, then starts the new one.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: open-webui
+  template:
+    metadata:
+      labels:
+        app: open-webui
+    spec:
+      containers:
+        - name: open-webui
+          image: ghcr.io/open-webui/open-webui:v0.10.2
+          ports:
+            - containerPort: 8080
+          env:
+            - name: OPENAI_API_BASE_URL
+              value: "http://litellm.ai-platform.svc.cluster.local:4000/v1"
+            # Scoped, NON-admin LiteLLM virtual key — NOT the master key. The
+            # master key can mint/delete keys, teams and budgets and edit config,
+            # so handing it to the most-exposed UI (public SSO signup) meant any
+            # Open WebUI compromise owned the whole gateway. This key can only
+            # make inference calls; per-user budgets/limits still apply via the
+            # forwarded x-openwebui-user-email header (see litellm config §1a).
+            # Minted + written to this Secret by the litellm-openwebui-key Job
+            # below. optional:true so the pod boots before the Job has run on a
+            # fresh install; the Job restarts this Deployment once the key exists.
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: open-webui-litellm-key
+                  key: api-key
+                  optional: true
+            - name: WEBUI_AUTH
+              value: "true"
+            # --- SSO (Cognito OIDC) + per-user cost attribution ---
+            # All secret refs are optional: until Terraform (enable_sso) creates
+            # `sso-secrets`, OAuth stays disabled and local login still works.
+            # OAuth activates automatically once the client id/secret exist.
+            - name: ENABLE_OAUTH_SIGNUP
+              value: "true"
+            # Hide the local email/password form so the UI goes straight to
+            # Cognito SSO (single sign-on across the platform, no local login).
+            - name: ENABLE_LOGIN_FORM
+              value: "false"
+            - name: OAUTH_PROVIDER_NAME
+              value: "SSO"
+            - name: OAUTH_SCOPES
+              value: "openid email profile"
+            - name: OAUTH_ROLES_CLAIM
+              value: "cognito:groups"
+            - name: ENABLE_OAUTH_ROLE_MANAGEMENT
+              value: "true"
+            - name: OAUTH_ALLOWED_ROLES
+              value: "ai-platform-admins,ai-platform-developers,ai-platform-users"
+            - name: OAUTH_ADMIN_ROLES
+              value: "ai-platform-admins"
+            # Forward the authenticated user to LiteLLM so spend is attributed
+            # per user (LiteLLM captures the X-OpenWebUI-User-* headers as tags).
+            - name: ENABLE_FORWARD_USER_INFO_HEADERS
+              value: "true"
+            - name: OPENID_PROVIDER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: openid-config-url
+                  optional: true
+            - name: OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: open-webui-client-id
+                  optional: true
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: open-webui-client-secret
+                  optional: true
+            - name: WEBUI_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: open-webui-public-url
+                  optional: true
+            # Explicit OAuth callback. Open WebUI otherwise derives it from the
+            # request (http + the ALB port 8080), which fails behind the
+            # TLS-terminating CloudFront edge. Terraform sets this to the public
+            # HTTPS callback (edge URL) or the localhost tunnel callback.
+            - name: OPENID_REDIRECT_URI
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: open-webui-oidc-redirect-uri
+                  optional: true
+            # Cognito's /logout is non-standard (needs client_id + logout_uri,
+            # rejects id_token_hint, and publishes no end_session_endpoint), so
+            # Open WebUI's default OIDC sign-out lands on a "Client does not
+            # exist" error. Point the OIDC end-session endpoint at the correct
+            # Cognito logout URL instead (Terraform builds it in sso-secrets).
+            - name: OPENID_END_SESSION_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: open-webui-oidc-end-session-endpoint
+                  optional: true
+          volumeMounts:
+            - name: data
+              mountPath: /app/backend/data
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: open-webui-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: open-webui-data
+  namespace: ai-platform
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: open-webui
+  namespace: ai-platform
+spec:
+  type: ClusterIP
+  selector:
+    app: open-webui
+  ports:
+    - port: 8080
+      targetPort: 8080
+      name: http
+---
+# No PodDisruptionBudget: Open WebUI uses a ReadWriteOnce PVC and a Recreate
+# rollout strategy, so it is intentionally single-replica (a second pod can't
+# mount the volume). maxUnavailable:1 over 1 replica is a no-op, and any stricter
+# PDB would only block node drains — so we omit it rather than imply an HA the
+# storage model can't provide.
+---
+# --- Scoped LiteLLM key provisioning for Open WebUI ---
+# Mints a NON-admin LiteLLM virtual key (via the master key, which never leaves
+# the ai-platform namespace) and stores it in the `open-webui-litellm-key`
+# Secret that the Deployment above reads. Replaces giving Open WebUI the master
+# key directly. Dedicated ServiceAccount with least privilege: create/read that
+# one Secret and restart only the open-webui Deployment.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litellm-openwebui-key
+  namespace: ai-platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: litellm-openwebui-key
+  namespace: ai-platform
+rules:
+  # create is not name-restrictable; get/patch are scoped to the two objects
+  # this Job touches. No list/watch, no access to other Secrets.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+    resourceNames: ["open-webui-litellm-key"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+    resourceNames: ["open-webui"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: litellm-openwebui-key
+  namespace: ai-platform
+subjects:
+  - kind: ServiceAccount
+    name: litellm-openwebui-key
+    namespace: ai-platform
+roleRef:
+  kind: Role
+  name: litellm-openwebui-key
+  apiGroup: rbac.authorization.k8s.io
+---
+# Runs as a PostSync hook (like litellm-enduser-budget): waits for LiteLLM, then
+# idempotently ensures the scoped key exists. If the Secret is already present
+# it does nothing (no key churn, no restart) — so it's safe on every sync.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: litellm-openwebui-key
+  namespace: ai-platform
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 20
+  template:
+    metadata:
+      labels:
+        app: open-webui
+        ai-platform/job: openwebui-key
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: litellm-openwebui-key
+      containers:
+        - name: mint-key
+          image: alpine/k8s:1.35.6
+          env:
+            - name: MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: master-key
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              BASE=http://litellm.ai-platform.svc.cluster.local:4000
+              NS=ai-platform
+              SECRET=open-webui-litellm-key
+
+              # Idempotent: if the key Secret already exists, leave it (and the
+              # running Open WebUI) untouched.
+              if kubectl get secret "$SECRET" -n "$NS" >/dev/null 2>&1; then
+                echo "Secret $SECRET already exists — nothing to do."
+                exit 0
+              fi
+
+              echo "Waiting for LiteLLM..."
+              for i in $(seq 1 60); do
+                if curl -fsS "$BASE/health/liveliness" >/dev/null 2>&1; then break; fi
+                sleep 5
+              done
+
+              # Mint a NON-admin virtual key. No models restriction (Open WebUI
+              # is the general chat front door; models are registered dynamically
+              # by litellm-sync). No key-level budget: per-user governance is
+              # enforced via the forwarded end-user header, not this shared key.
+              # key_alias makes it identifiable/rotatable in the LiteLLM UI.
+              API_KEY=$(curl -fsS -X POST "$BASE/key/generate" \
+                -H "Authorization: Bearer $MASTER_KEY" \
+                -H "Content-Type: application/json" \
+                -d '{"key_alias":"open-webui","metadata":{"managed_by":"platform","service":"open-webui"}}' \
+                | jq -r '.key')
+
+              [ -n "$API_KEY" ] && [ "$API_KEY" != "null" ] || { echo "ERROR: key generation failed"; exit 1; }
+
+              kubectl create secret generic "$SECRET" -n "$NS" \
+                --from-literal=api-key="$API_KEY"
+              echo "Created $SECRET."
+
+              # Open WebUI read OPENAI_API_KEY at startup and booted before this
+              # key existed — restart it once so it picks the key up.
+              kubectl rollout restart deployment/open-webui -n "$NS"
+              echo "Restarted open-webui to load the scoped key."
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi

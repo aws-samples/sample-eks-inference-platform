@@ -1,0 +1,181 @@
+# Platform — ArgoCD ApplicationSet defining all platform services.
+#
+# Eight applications (by default) in two shapes:
+#   - Plain-directory sources (platform-config, inference-gateway, litellm,
+#     open-webui, cluster-dashboard, litellm-sync): manifests live in this repo
+#     and are applied as-is.
+#   - Helm multi-source (gpu-operator, langfuse): chart pulled from upstream,
+#     values file pulled from this repo.
+#
+# The Platform Health Agent is NOT a separate app — it ships as a component of
+# cluster-dashboard (see the note by that element below). It's always synced but
+# idles unless a Kiro API key is provisioned (Terraform, opt-in).
+#
+# FORKING THE PLATFORM — set the repo URL in ONE place: var.gitops_repo_url
+# (+ var.gitops_revision) in your tfvars. This directory is a Helm chart; the
+# root `bootstrap` Application (rendered by Terraform) passes those values in as
+# Helm values, and this ApplicationSet reads them below (.Values.repoURL /
+# .Values.revision) — so both the platform and workloads ApplicationSets inherit
+# the one tfvars value. Self-service workloads may live in a separate repo; see
+# var.gitops_workloads_repo_url and argocd/bootstrap/templates/workloads.yaml.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: platform
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - list:
+        elements:
+          # --- Infrastructure (hidden in day-to-day, always healthy) ---
+          - name: platform-config
+            namespace: argocd
+            type: directory
+            path: platform/config
+            recurse: "true"
+            tier: infra
+          - name: gpu-operator
+            namespace: gpu-operator
+            type: helm
+            chart: gpu-operator
+            chartRepo: https://helm.ngc.nvidia.com/nvidia
+            chartVersion: v25.10.1
+            valuesPath: platform/services/gpu-operator/helm-values.yaml
+            tier: infra
+          # GIE CRDs (InferencePool) + the llm-d OCI Helm repo registration —
+          # the substrate the LLMDEndpoint scale tier needs. Minimal (CRDs + a
+          # repo Secret, no running pods); shipped by default so teams can use
+          # LLMDEndpoint with no cluster toggle. See its README.
+          - name: inference-gateway
+            namespace: argocd
+            type: directory
+            path: platform/services/inference-gateway
+            tier: infra
+          # --- Platform Services (user-facing) ---
+          - name: litellm
+            namespace: ai-platform
+            type: directory
+            path: platform/services/litellm
+            tier: platform
+          - name: open-webui
+            namespace: ai-platform
+            type: directory
+            path: platform/services/open-webui
+            tier: platform
+          - name: langfuse
+            namespace: ai-platform
+            type: helm
+            chart: langfuse
+            chartRepo: https://langfuse.github.io/langfuse-k8s
+            chartVersion: "1.5.20"
+            valuesPath: platform/services/langfuse/helm-values.yaml
+            tier: platform
+          # cluster-dashboard ALSO ships the Platform Health Agent as a component
+          # (platform/services/cluster-dashboard/pha-*.yaml) — no separate app or
+          # namespace. The agent is always synced but idles gracefully unless a
+          # Kiro API key Secret is present (Terraform provisions it only when
+          # platform_health_agent_enabled=true). Enable = set the tfvar (+
+          # TF_VAR_kiro_api_key), apply, restart the event-watcher Deployment.
+          # See platform/services/cluster-dashboard/PLATFORM-HEALTH-AGENT.md.
+          - name: cluster-dashboard
+            namespace: ai-platform
+            type: directory
+            path: platform/services/cluster-dashboard
+            tier: platform
+          # Owns LiteLLM's model registry: registers + deregisters models for
+          # all three serving tiers (watched cluster-wide via a finalizer), so
+          # the master key never enters a workload namespace. Lives in the
+          # `inference` namespace.
+          - name: litellm-sync
+            namespace: inference
+            type: directory
+            path: platform/services/litellm-sync
+            tier: platform
+  template:
+    metadata:
+      name: '{{`{{.name}}`}}'
+      namespace: argocd
+      labels:
+        app.kubernetes.io/part-of: ai-platform
+        tier: '{{`{{.tier}}`}}'
+    spec:
+      project: default
+      destination:
+        name: local-cluster
+        namespace: '{{`{{.namespace}}`}}'
+      ignoreDifferences:
+        - group: nvidia.com
+          kind: ClusterPolicy
+          jsonPointers:
+            - /spec
+        - group: apps
+          kind: StatefulSet
+          jsonPointers:
+            - /spec/persistentVolumeClaimRetentionPolicy
+            - /spec/podManagementPolicy
+            - /spec/revisionHistoryLimit
+            - /spec/updateStrategy
+          # The API server adds an empty `status: {phase: Pending}` to each
+          # entry of spec.volumeClaimTemplates when the StatefulSet is read
+          # back. ArgoCD's diff comparator doesn't always strip it, causing
+          # permanent OutOfSync drift. Ignore it explicitly.
+          jqPathExpressions:
+            - '.spec.volumeClaimTemplates[].status'
+        # Langfuse sign-in URL: the chart renders the placeholder NEXTAUTH_URL
+        # (localhost:3000) into langfuse-web, but the langfuse-nextauth-url
+        # CronJob (platform/config/langfuse-nextauth-url.yaml) rewrites it to the
+        # live ALB hostname so UI login works behind the load balancer. Ignore
+        # that one env value so selfHeal doesn't revert it every sync (which
+        # would flap the pod). Scoped by name=langfuse-web — no other app owns
+        # that Deployment, so this rule is inert for them.
+        - group: apps
+          kind: Deployment
+          name: langfuse-web
+          jqPathExpressions:
+            - '.spec.template.spec.containers[].env[]? | select(.name == "NEXTAUTH_URL")'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          # Compare against server-side dry-run apply rather than the raw
+          # manifest. Without this, API-server-defaulted fields (e.g.
+          # imagePullPolicy: IfNotPresent, ports[].protocol: TCP,
+          # configMap.defaultMode: 420, volumeClaimTemplates[].spec.volumeMode)
+          # are reported as OutOfSync forever even though SSA succeeds.
+          - ServerSideDiff=true
+  # templatePatch is ApplicationSet Go-templating (goTemplate), evaluated by the
+  # ApplicationSet CONTROLLER at runtime — NOT by Helm. The only Helm-rendered
+  # bits are .Values.repoURL / .Values.revision on the two $repo/$rev lines
+  # (injected once by Terraform); the rest is wrapped in a Helm raw block so it
+  # reaches the controller verbatim.
+  templatePatch: |
+    {{`{{- $repo := "`}}{{ .Values.repoURL }}{{`" }}`}}
+    {{`{{- $rev := "`}}{{ .Values.revision }}{{`" }}`}}
+    {{`spec:
+      {{- if eq .type "directory" }}
+      source:
+        repoURL: {{ $repo }}
+        targetRevision: {{ $rev }}
+        path: {{ .path }}
+        {{- if eq .recurse "true" }}
+        directory:
+          recurse: true
+        {{- end }}
+      {{- end }}
+      {{- if eq .type "helm" }}
+      sources:
+        - repoURL: {{ .chartRepo }}
+          chart: {{ .chart }}
+          targetRevision: {{ .chartVersion }}
+          helm:
+            valueFiles:
+              - $values/{{ .valuesPath }}
+        - repoURL: {{ $repo }}
+          targetRevision: {{ $rev }}
+          ref: values
+      {{- end }}`}}

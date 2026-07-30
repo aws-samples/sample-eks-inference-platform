@@ -1,0 +1,18 @@
+# Example AITeam — copy this file and edit to onboard a new team.
+# Commit and push; ArgoCD deploys it automatically.
+apiVersion: kro.run/v1alpha1
+kind: AITeam
+metadata:
+  name: example-team
+  namespace: ai-platform
+spec:
+  teamName: example
+  models: ["qwen3-3b"]         # Models this team can access (* = all)
+  maxBudget: "100.0"           # Monthly budget in USD
+  budgetDuration: "30d"        # Budget reset period
+  rpmLimit: 60                 # Requests per minute
+  tpmLimit: 100000             # Tokens per minute
+  # Optional per-team Langfuse tracing: create a Secret in the ai-platform
+  # namespace with data keys `public-key` and `secret-key`, then set:
+  # langfuseSecretName: my-team-langfuse
+  # (Never put the key values directly in this file — it lives in git.)

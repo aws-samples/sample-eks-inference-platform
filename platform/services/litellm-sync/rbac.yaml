@@ -1,0 +1,38 @@
+# RBAC for litellm-sync.
+#
+# The controller now owns registration + deregistration for all three serving
+# tiers across ALL namespaces (models can be deployed into per-team `team-*`
+# namespaces), so it needs a ClusterRole (not a namespaced Role). It only reads
+# the serving CRs and patches their finalizers — no other access. The LiteLLM
+# master key is injected as an env var (secretKeyRef in deployment.yaml), so no
+# Secret API access is needed, and the master key never leaves this namespace.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: litellm-sync
+  namespace: inference
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: litellm-sync
+rules:
+  - apiGroups: ["kro.run"]
+    resources: ["vllmendpoints", "llmdendpoints", "llmddisaggendpoints"]
+    # watch/list to observe; get for re-reads; patch/update to add and remove
+    # the finalizer on metadata.
+    verbs: ["get", "list", "watch", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: litellm-sync
+subjects:
+  - kind: ServiceAccount
+    name: litellm-sync
+    namespace: inference
+roleRef:
+  kind: ClusterRole
+  name: litellm-sync
+  apiGroup: rbac.authorization.k8s.io

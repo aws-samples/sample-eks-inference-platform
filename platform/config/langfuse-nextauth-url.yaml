@@ -1,0 +1,172 @@
+# Langfuse sign-in URL reconciler (turnkey ALB access).
+#
+# Why this exists: Langfuse runs NextAuth, which validates the sign-in request's
+# Host header against NEXTAUTH_URL. Through the shared ALB the browser hits
+# http://<alb-hostname>:3000, but the Helm chart renders the placeholder
+# `nextauth.url` (http://localhost:3000, tunnel-only) into the langfuse-web
+# Deployment — so UI login fails behind the ALB. The auto-generated ALB hostname
+# isn't known until the AWS Load Balancer Controller provisions it (after the
+# ingress syncs), so it can't be baked into git or Terraform a priori.
+#
+# This CronJob closes the loop: it sets NEXTAUTH_URL on the langfuse-web
+# Deployment to the platform's browser-facing origin — the CloudFront edge URL,
+# or the localhost tunnel URL when the edge is off (both match the registered
+# Cognito callback, so SSO completes) — falling back to the auto-provisioned ALB
+# hostname only if that public URL can't be read. It is the event-less reconciler
+# counterpart to litellm-cleanup (platform/config/litellm-cleanup.yaml).
+#
+# Paired requirement: ArgoCD's selfHeal would otherwise revert NEXTAUTH_URL to
+# the chart placeholder every sync (flapping the pod). An `ignoreDifferences`
+# rule on the langfuse app (argocd/bootstrap/platform.yaml) tells ArgoCD to leave
+# that env value alone — so once set, it sticks and this CronJob no-ops forever.
+#
+# Operator override: if you pin a real domain by editing `nextauth.url` in
+# platform/services/langfuse/helm-values.yaml (e.g. https://langfuse.example.com
+# behind Route53 + ACM), this reconciler detects the non-placeholder value and
+# leaves it untouched. It only manages the localhost placeholder and its own
+# ALB-derived value.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: langfuse-nextauth-url
+  namespace: ai-platform
+---
+# Least-privilege, namespaced: read the ingress status, read+patch the one
+# Deployment. No ClusterRole needed — everything is in ai-platform.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: langfuse-nextauth-url
+  namespace: ai-platform
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "patch"]
+  # Read sso-secrets to prefer the public (CloudFront edge / domain) URL.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["sso-secrets"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: langfuse-nextauth-url
+  namespace: ai-platform
+subjects:
+  - kind: ServiceAccount
+    name: langfuse-nextauth-url
+    namespace: ai-platform
+roleRef:
+  kind: Role
+  name: langfuse-nextauth-url
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: langfuse-nextauth-url
+  namespace: ai-platform
+spec:
+  # Every 5 min is plenty: the value changes ~never after first boot. The first
+  # run (during initial cluster bring-up) polls long enough to catch the ALB as
+  # it finishes provisioning; subsequent runs are instant no-ops.
+  schedule: "*/5 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 120
+      activeDeadlineSeconds: 480     # cap a run that's polling for a slow ALB
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          serviceAccountName: langfuse-nextauth-url
+          nodeSelector:
+            kubernetes.io/arch: amd64
+          containers:
+            - name: reconcile
+              image: alpine/k8s:1.35.6   # bundles kubectl; already used in-repo
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  set -eu
+                  NS=ai-platform
+                  ING=ai-platform-langfuse
+                  DEPLOY=langfuse-web
+                  PORT=3000
+
+                  # 0. Wait for the langfuse-web Deployment to exist (~2 min).
+                  for i in $(seq 1 12); do
+                    kubectl get deploy "$DEPLOY" -n "$NS" >/dev/null 2>&1 && break
+                    echo "waiting for deployment/$DEPLOY ... ($i)"; sleep 10
+                  done
+
+                  # 1. Prefer the configured public URL (CloudFront edge, or a
+                  #    custom domain in sso_public_urls) — that's the browser-
+                  #    facing origin when the platform is exposed publicly. Falls
+                  #    through to the ALB hostname (turnkey) when it's unset.
+                  PUBLIC=$(kubectl get secret sso-secrets -n "$NS" \
+                    -o jsonpath='{.data.langfuse-public-url}' 2>/dev/null \
+                    | base64 -d 2>/dev/null || true)
+                  # Use it as-is — INCLUDING the localhost tunnel URL, which is the
+                  # sanctioned edge-off access and matches the localhost Cognito
+                  # callback (NextAuth's redirect_uri must equal NEXTAUTH_URL, and
+                  # only the localhost callback is registered when the edge is off).
+                  # The ALB branch below is only a fallback when the secret can't
+                  # be read — it broke SSO over the tunnel when used unconditionally.
+
+                  # 2. Current NEXTAUTH_URL on the Deployment (first match wins).
+                  CURRENT=$(kubectl get deploy "$DEPLOY" -n "$NS" \
+                    -o jsonpath='{.spec.template.spec.containers[*].env[?(@.name=="NEXTAUTH_URL")].value}' \
+                    2>/dev/null || true)
+                  CURRENT=$(printf '%s' "$CURRENT" | awk '{print $1}')
+
+                  if [ -n "$PUBLIC" ]; then
+                    # Public front door: the CloudFront edge URL, or the localhost
+                    # tunnel URL when the edge is off. Either matches the Cognito
+                    # callback, so NextAuth's sign-in redirect completes.
+                    DESIRED="$PUBLIC"
+                  else
+                    # Last resort (sso-secrets unreadable): derive the ALB hostname.
+                    HOST=""
+                    for i in $(seq 1 30); do
+                      HOST=$(kubectl get ingress "$ING" -n "$NS" \
+                        -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+                      [ -n "$HOST" ] && break
+                      echo "waiting for ALB hostname on ingress/$ING ... ($i)"; sleep 10
+                    done
+                    if [ -z "$HOST" ]; then
+                      echo "ALB hostname not ready yet; will retry next run."; exit 0
+                    fi
+                    DESIRED="http://${HOST}:${PORT}"
+                  fi
+
+                  # Manage only our own values (chart localhost placeholder, our
+                  # CloudFront/ALB value, or the value we're about to set) — defer
+                  # to an operator-pinned custom URL.
+                  case "$CURRENT" in
+                    ""|*localhost*|*elb.amazonaws.com*|*cloudfront.net*|"$DESIRED") : ;;
+                    *) echo "NEXTAUTH_URL pinned to '$CURRENT' — leaving as-is."; exit 0 ;;
+                  esac
+
+                  # 3. Idempotent: patch + roll only when the value changes.
+                  if [ "$CURRENT" = "$DESIRED" ]; then
+                    echo "NEXTAUTH_URL already '$DESIRED' — nothing to do."; exit 0
+                  fi
+                  echo "Setting NEXTAUTH_URL: '${CURRENT:-<unset>}' -> '$DESIRED'"
+                  kubectl set env "deployment/$DEPLOY" -n "$NS" "NEXTAUTH_URL=$DESIRED"
+                  echo "Done — langfuse-web will roll to pick up the new sign-in URL."
+              resources:
+                requests:
+                  cpu: "10m"
+                  memory: "32Mi"
+                limits:
+                  cpu: "100m"
+                  memory: "64Mi"

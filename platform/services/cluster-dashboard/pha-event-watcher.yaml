@@ -1,0 +1,210 @@
+# Event Watcher Deployment.
+#
+# Long-running pod that watches the K8s API, debounces, and spawns
+# Investigator Jobs. Single replica (informers + DB writes; no need
+# for HA yet — recovery is automatic via reconnect logic).
+#
+# Image strategy: python:3.12-slim base + initContainer that installs
+# python-kubernetes + psycopg into an emptyDir shared with the main
+# container. No custom image, matches cluster-dashboard pattern.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: event-watcher
+  namespace: ai-platform
+  labels:
+    app.kubernetes.io/name: event-watcher
+    app.kubernetes.io/part-of: platform-health-agent
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate                      # single-writer to postgres; no rolling
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: event-watcher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: event-watcher
+        app.kubernetes.io/part-of: platform-health-agent
+    spec:
+      serviceAccountName: platform-health-agent-reader
+      automountServiceAccountToken: true
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      initContainers:
+        - name: db-init
+          # Idempotent DB provisioning. Runs on every pod restart but is
+          # near-instant once the database + tables already exist.
+          # Uses the same db_init.sh + ddl.sql from the scripts ConfigMap.
+          image: postgres:16.14-alpine
+          command: ["/bin/sh", "/scripts/db_init.sh"]
+          env:
+            - name: DB_HOST
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: DB_HOST } }
+            - name: DB_PORT
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: DB_PORT } }
+            - name: DB_NAME
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: DB_NAME } }
+            - name: PG_SUPERUSER
+              valueFrom: { secretKeyRef: { name: platform-db-credentials, key: username } }
+            - name: PG_SUPERPASSWORD
+              valueFrom: { secretKeyRef: { name: platform-db-credentials, key: password } }
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests: { cpu: "50m",  memory: "64Mi" }
+            limits:   { cpu: "200m", memory: "128Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 70                  # 'postgres' uid in postgres:16.14-alpine
+            capabilities: { drop: ["ALL"] }
+        - name: install-pydeps
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              pip install --no-cache-dir --target=/pydeps \
+                  kubernetes==31.0.0 \
+                  psycopg[binary]==3.2.3
+          volumeMounts:
+            - name: pydeps
+              mountPath: /pydeps
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: watcher
+          image: python:3.12-slim
+          command: ["python3", "/scripts/event_watcher.py"]
+          env:
+            - name: PYTHONPATH
+              value: /pydeps
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # ConfigMap (everything in platform-health-agent-config)
+            - name: CLUSTER_NAME
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: CLUSTER_NAME } }
+            - name: AWS_REGION
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: AWS_REGION } }
+            - name: WATCH_NAMESPACES
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: WATCH_NAMESPACES } }
+            - name: EXCLUDE_NAMESPACES
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: EXCLUDE_NAMESPACES } }
+            - name: DEBOUNCE_WINDOW_SEC
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: DEBOUNCE_WINDOW_SEC } }
+            - name: OUT_OF_SCOPE_COOLDOWN_SEC
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: OUT_OF_SCOPE_COOLDOWN_SEC } }
+            - name: TRIGGER_CRASHLOOP
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_CRASHLOOP } }
+            - name: TRIGGER_OOMKILLED
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_OOMKILLED } }
+            - name: TRIGGER_IMAGEPULL
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_IMAGEPULL } }
+            - name: TRIGGER_FAILEDSCHED
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_FAILEDSCHED } }
+            - name: TRIGGER_NODENOTREADY
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_NODENOTREADY } }
+            - name: TRIGGER_FAILEDMOUNT
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_FAILEDMOUNT } }
+            - name: TRIGGER_STUCKRESOURCE
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_STUCKRESOURCE } }
+            - name: TRIGGER_CONFIGERROR
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_CONFIGERROR } }
+            - name: TRIGGER_RUNCONTAINERERROR
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_RUNCONTAINERERROR } }
+            - name: TRIGGER_NODEPRESSURE
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_NODEPRESSURE } }
+            - name: TRIGGER_PODSANDBOX
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_PODSANDBOX } }
+            - name: TRIGGER_PODNOTREADY
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: TRIGGER_PODNOTREADY } }
+            - name: STUCK_RESOURCE_THRESHOLD_SEC
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: STUCK_RESOURCE_THRESHOLD_SEC } }
+            - name: STUCK_RESOURCE_POLL_INTERVAL
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: STUCK_RESOURCE_POLL_INTERVAL } }
+            - name: POD_NOT_READY_THRESHOLD_SEC
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: POD_NOT_READY_THRESHOLD_SEC } }
+            - name: MAX_CONCURRENT_INVESTIGATIONS
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: MAX_CONCURRENT_INVESTIGATIONS } }
+            - name: MAX_INVESTIGATIONS_PER_DAY
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: MAX_INVESTIGATIONS_PER_DAY } }
+            - name: KIRO_MODEL_INVESTIGATE
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: KIRO_MODEL_INVESTIGATE } }
+            - name: KIRO_MODEL_REMEDIATE
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: KIRO_MODEL_REMEDIATE } }
+            - name: PYTHON_IMAGE
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: PYTHON_IMAGE } }
+            - name: KUBECTL_VERSION
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: KUBECTL_VERSION } }
+            - name: DB_HOST
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: DB_HOST } }
+            - name: DB_PORT
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: DB_PORT } }
+            - name: DB_NAME
+              valueFrom: { configMapKeyRef: { name: platform-health-agent-config, key: DB_NAME } }
+            # DB credentials reuse the existing platform Postgres credentials.
+            - name: DB_USER
+              valueFrom: { secretKeyRef: { name: platform-db-credentials, key: username } }
+            - name: DB_PASSWORD
+              valueFrom: { secretKeyRef: { name: platform-db-credentials, key: password } }
+            # Kiro API key gates the agent. OPTIONAL (optional: true) so the pod
+            # boots even when PHA is not enabled — this Secret is created manually
+            # with kubectl (see PLATFORM-HEALTH-AGENT.md). Absent → the watcher
+            # idles gracefully (no investigations); present → it activates.
+            - name: KIRO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: platform-health-agent-secrets
+                  key: KIRO_API_KEY
+                  optional: true
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: pydeps
+              mountPath: /pydeps
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          ports:
+            - name: health
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: scripts
+          configMap:
+            name: platform-health-agent-scripts
+            defaultMode: 0755
+        - name: pydeps
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

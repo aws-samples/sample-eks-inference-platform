@@ -1,0 +1,607 @@
+# LLMDDisaggEndpoint — prefill/decode DISAGGREGATED scale-tier serving via llm-d.
+#
+# The disaggregated sibling of LLMDEndpoint. Long prompts make prefill
+# (compute-bound) contend with decode (bandwidth-bound) on the same GPUs,
+# spiking inter-token latency under load. This RGD splits them into two pools:
+#
+#   - prefill pool  (llm-d.ai/role: prefill): processes prompts, produces KV cache
+#   - decode pool   (llm-d.ai/role: decode):  pulls that KV + generates tokens,
+#     and carries the routing-sidecar that orchestrates the P/D split
+#   Both vLLMs run --kv-transfer-config kv_role=kv_both (NIXL); the decode
+#   sidecar decides which prefill pod (if any) serves each request.
+#
+# KV cache blocks move prefill→decode over NIXL (RDMA/NVLink/TCP via UCX). The
+# llm-d router (EPP + InferencePool) selects the pool (llm-d.ai/pool=<name>) and
+# schedules prefill→prefill pods, decode→decode pods.
+#
+#   Request path: LiteLLM -> llm-d router (Envoy + EPP) -> InferencePool
+#                 -> prefill pod (KV producer) --NIXL--> decode pod (KV consumer)
+#
+# ── EXPERIMENTAL — GPU smoke-test findings (2026-07) ────────────────────────
+#   1. [PASS] NIXL is bundled in vllm/vllm-openai:v0.24.0 — both pools init the
+#      NixlPullConnector + NIXL Scheduler with no extra image work.
+#   2. [PASS] Deploys + serves end to end: both role-labeled pools become Ready,
+#      the model registers in LiteLLM, and requests return correct completions.
+#   3. [DONE] TRUE P/D routing. The EPP runs the `disagg-profile-handler` with
+#      separate `prefill`/`decode` scheduling profiles (prefill-filter/decode-
+#      filter on `llm-d.ai/role`) + a PD decider (pdDisaggregation: prefix-based
+#      default, or always). The decode pods carry the llm-d routing-sidecar
+#      (8000) which reverse-proxies local vLLM (8200) and, when the EPP selects a
+#      prefill pod, dispatches a remote prefill (max_tokens=1) there and pulls the
+#      KV over NIXL — so prefill runs only on prefill pods, decode only on decode
+#      pods. Both vLLMs use kv_role=kv_both (the sidecar drives per-request P/D).
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: llmd-disagg-endpoint
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: LLMDDisaggEndpoint
+    spec:
+      model:                "string"
+      gpuCount:             "integer | default=1"
+      tensorParallelSize:   "integer | default=0"
+      # DEPRECATED — superseded by prefill/decode Min/MaxReplicas; ignored by this
+      # RGD. Retained (not removed) to avoid a breaking CRD change (KRO refuses to
+      # drop schema properties in place).
+      prefillReplicas:         "integer | default=1 minimum=1"
+      decodeReplicas:          "integer | default=2 minimum=1"
+      # Prefill pool (compute-bound): autoscaled on queue depth.
+      prefillMinReplicas:      "integer | default=1 minimum=1"   # floor (>=1; scale-to-zero parked)
+      prefillMaxReplicas:      "integer | default=2 minimum=1"   # ceiling; > min enables autoscaling
+      prefillTargetQueueDepth: "integer | default=20"            # per-pod vllm:num_requests_waiting target
+      # Decode pool (KV-cache/bandwidth-bound): autoscaled on KV-cache utilization.
+      decodeMinReplicas:       "integer | default=1 minimum=1"   # floor (>=1)
+      decodeMaxReplicas:       "integer | default=4 minimum=1"   # ceiling; > min enables autoscaling
+      decodeTargetKvCachePct:  "integer | default=85"            # target avg vllm:kv_cache_usage_perc (%)
+      maxModelLen:          "integer | default=16384"
+      minVramPerGpuGiB:     "integer | default=0"
+      workerMemory:         "string  | default=16Gi"
+      workerCpu:            "string  | default=8"
+      vllmImage:            "string  | default=vllm/vllm-openai:v0.24.0"
+      # Optional tool/function calling (see VLLMEndpoint), applied to BOTH the
+      # prefill and decode vLLM pools. `platformctl new-model` auto-fills the
+      # parser from the model architecture; empty = chat-only. extraArgs appends
+      # any other raw vLLM flags (to both pools).
+      toolCallParser:       "string"
+      extraArgs:            "[]string"
+      routerChartVersion:   "string  | default=v0.9.0"
+      routingProfile:       'string | default=prefix enum="balanced,prefix,throughput,latency"'
+      # True prefill/decode disaggregation (via the decode routing-sidecar + EPP
+      # disagg-profile-handler). pdDisaggregation selects the PD decider:
+      #   prefix-based (DEFAULT, all clusters) — disaggregate only when the
+      #     non-cached prompt suffix exceeds pdNonCachedTokens (skips the network
+      #     hop for short/cached prompts);
+      #   always — force disaggregation on every request (validation/benchmark).
+      pdDisaggregation:     'string | default=prefix-based enum="prefix-based,always"'
+      pdNonCachedTokens:    "integer | default=8"              # prefix-based decider threshold
+      routingSidecarImage:  "string  | default=ghcr.io/llm-d/llm-d-routing-sidecar:v0.7.1"
+      # Opt-in P/D nodepool split (large-scale only). Default = the shared
+      # gpu-inference pool (prefill+decode co-located, no cross-node KV hop).
+      # Set gpu-prefill (compute-optimized) / gpu-decode (bandwidth-optimized) to
+      # run each phase on hardware matched to its bottleneck — worth it for large
+      # models (>=~30B) under sustained multi-replica decode. See
+      # terraform/30.eks/30.cluster/karpenter/gpu-{prefill,decode}.yaml.
+      prefillNodePool:      "string  | default=gpu-inference"   # or gpu-prefill
+      decodeNodePool:       "string  | default=gpu-inference"   # or gpu-decode
+    status:
+      ready:             "${decodedeployment.status.?availableReplicas.orValue(0) > 0 ? 'True' : 'False'}"
+      prefillReplicas:   ${prefilldeployment.status.?availableReplicas.orValue(0)}
+      decodeReplicas:    ${decodedeployment.status.?availableReplicas.orValue(0)}
+      routerHealth:      "${routerapp.status.?health.?status.orValue('Unknown')}"
+
+  resources:
+    - id: platformConfig
+      externalRef:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: platform-config
+
+    # ── Prefill pool: KV producer ───────────────────────────────────────────
+    - id: prefilldeployment
+      readyWhen:
+        - ${prefilldeployment.status.?availableReplicas.orValue(0) > 0}
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${schema.metadata.name}-prefill
+          labels:
+            app.kubernetes.io/name: ${schema.metadata.name}
+            ai-platform/serving-mode: llm-d-disagg
+            llm-d.ai/role: prefill
+        spec:
+          # NOTE: replicas intentionally unset — the prefill KEDA ScaledObject/HPA
+          # owns the count. Setting it makes KRO fight the autoscaler.
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: ${schema.metadata.name}
+              llm-d.ai/pool: ${schema.metadata.name}
+              llm-d.ai/role: prefill
+          template:
+            metadata:
+              labels:
+                app.kubernetes.io/name: ${schema.metadata.name}
+                llm-d.ai/pool: ${schema.metadata.name}
+                llm-d.ai/role: prefill
+              annotations:
+                karpenter.sh/do-not-disrupt: "true"
+            spec:
+              serviceAccountName: inference-worker
+              nodeSelector:
+                workload-type: ${schema.spec.prefillNodePool}
+              tolerations:
+                - key: nvidia.com/gpu
+                  operator: Exists
+                  effect: NoSchedule
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - key: karpenter.k8s.aws/instance-gpu-memory
+                            operator: Gt
+                            values:
+                              - "${string(schema.spec.minVramPerGpuGiB > 0 ? ((schema.spec.minVramPerGpuGiB - 1) * 1024) - 1 : 0)}"
+              initContainers:
+                - name: hf-cache-download
+                  image: peakcom/s5cmd:v2.3.0
+                  env:
+                    - name: MODEL_ID
+                      value: ${schema.spec.model}
+                    - name: CACHE_BUCKET
+                      value: ${platformConfig.data.?modelCacheBucket.orValue("")}
+                    - name: AWS_REGION
+                      value: ${platformConfig.data.?region.orValue("us-east-1")}
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      set -u
+                      if [ -z "$CACHE_BUCKET" ]; then echo "no cache bucket"; exit 0; fi
+                      PREFIX="hf/$MODEL_ID"
+                      LOCAL="/hf-cache/hub/models--$(echo "$MODEL_ID" | sed 's#/#--#g')"
+                      if /s5cmd ls "s3://$CACHE_BUCKET/$PREFIX/" >/dev/null 2>&1; then
+                        mkdir -p "$LOCAL"; /s5cmd sync "s3://$CACHE_BUCKET/$PREFIX/*" "$LOCAL/" || rm -rf "$LOCAL"
+                      fi
+                  volumeMounts:
+                    - name: hf-cache
+                      mountPath: /hf-cache
+              containers:
+                - name: modelserver
+                  image: ${platformConfig.data.?vllmImage.orValue(schema.spec.vllmImage)}
+                  command: ["vllm", "serve"]
+                  # Base flags + optional tool calling / extraArgs (see
+                  # VLLMEndpoint), as one CEL list.
+                  args: >-
+                    ${[schema.spec.model,
+                       "--served-model-name", schema.spec.model,
+                       "--tensor-parallel-size", string(schema.spec.tensorParallelSize > 0 ? schema.spec.tensorParallelSize : schema.spec.gpuCount),
+                       "--max-model-len", string(schema.spec.maxModelLen),
+                       "--gpu-memory-utilization", "0.9",
+                       "--kv-transfer-config", '{"kv_connector":"NixlConnector","kv_role":"kv_both"}',
+                       "--port", "8000",
+                       "--disable-access-log-for-endpoints=/health,/metrics,/v1/models"]
+                    + (schema.spec.?toolCallParser.orValue("") != "" ? ["--enable-auto-tool-choice", "--tool-call-parser", schema.spec.?toolCallParser.orValue("")] : [])
+                    + schema.spec.?extraArgs.orValue([])}
+                  env:
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                    - name: HF_HOME
+                      value: /hf-cache
+                    - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+                      value: "5600"
+                    - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: UCX_TLS
+                      value: "all"
+                  ports:
+                    - name: modelserver
+                      containerPort: 8000
+                    - name: nixl
+                      containerPort: 5600
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                    failureThreshold: 80
+                  resources:
+                    requests:
+                      cpu: ${schema.spec.workerCpu}
+                      memory: ${schema.spec.workerMemory}
+                      nvidia.com/gpu: ${schema.spec.gpuCount}
+                    limits:
+                      cpu: ${schema.spec.workerCpu}
+                      memory: ${schema.spec.workerMemory}
+                      nvidia.com/gpu: ${schema.spec.gpuCount}
+                  volumeMounts:
+                    - name: hf-cache
+                      mountPath: /hf-cache
+                    - name: shm
+                      mountPath: /dev/shm
+              volumes:
+                - name: hf-cache
+                  emptyDir:
+                    sizeLimit: 100Gi
+                - name: shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 8Gi
+
+    # ── Decode pool: KV consumer ────────────────────────────────────────────
+    - id: decodedeployment
+      readyWhen:
+        - ${decodedeployment.status.?availableReplicas.orValue(0) > 0}
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${schema.metadata.name}-decode
+          labels:
+            app.kubernetes.io/name: ${schema.metadata.name}
+            ai-platform/serving-mode: llm-d-disagg
+            llm-d.ai/role: decode
+        spec:
+          # NOTE: replicas intentionally unset — the decode KEDA ScaledObject/HPA
+          # owns the count. Setting it makes KRO fight the autoscaler.
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: ${schema.metadata.name}
+              llm-d.ai/pool: ${schema.metadata.name}
+              llm-d.ai/role: decode
+          template:
+            metadata:
+              labels:
+                app.kubernetes.io/name: ${schema.metadata.name}
+                llm-d.ai/pool: ${schema.metadata.name}
+                llm-d.ai/role: decode
+              annotations:
+                karpenter.sh/do-not-disrupt: "true"
+            spec:
+              serviceAccountName: inference-worker
+              nodeSelector:
+                workload-type: ${schema.spec.decodeNodePool}
+              tolerations:
+                - key: nvidia.com/gpu
+                  operator: Exists
+                  effect: NoSchedule
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - key: karpenter.k8s.aws/instance-gpu-memory
+                            operator: Gt
+                            values:
+                              - "${string(schema.spec.minVramPerGpuGiB > 0 ? ((schema.spec.minVramPerGpuGiB - 1) * 1024) - 1 : 0)}"
+              initContainers:
+                - name: hf-cache-download
+                  image: peakcom/s5cmd:v2.3.0
+                  env:
+                    - name: MODEL_ID
+                      value: ${schema.spec.model}
+                    - name: CACHE_BUCKET
+                      value: ${platformConfig.data.?modelCacheBucket.orValue("")}
+                    - name: AWS_REGION
+                      value: ${platformConfig.data.?region.orValue("us-east-1")}
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      set -u
+                      if [ -z "$CACHE_BUCKET" ]; then echo "no cache bucket"; exit 0; fi
+                      PREFIX="hf/$MODEL_ID"
+                      LOCAL="/hf-cache/hub/models--$(echo "$MODEL_ID" | sed 's#/#--#g')"
+                      if /s5cmd ls "s3://$CACHE_BUCKET/$PREFIX/" >/dev/null 2>&1; then
+                        mkdir -p "$LOCAL"; /s5cmd sync "s3://$CACHE_BUCKET/$PREFIX/*" "$LOCAL/" || rm -rf "$LOCAL"
+                      fi
+                  volumeMounts:
+                    - name: hf-cache
+                      mountPath: /hf-cache
+              containers:
+                - name: modelserver
+                  image: ${platformConfig.data.?vllmImage.orValue(schema.spec.vllmImage)}
+                  command: ["vllm", "serve"]
+                  # Base flags + optional tool calling / extraArgs (see
+                  # VLLMEndpoint), as one CEL list.
+                  args: >-
+                    ${[schema.spec.model,
+                       "--served-model-name", schema.spec.model,
+                       "--tensor-parallel-size", string(schema.spec.tensorParallelSize > 0 ? schema.spec.tensorParallelSize : schema.spec.gpuCount),
+                       "--max-model-len", string(schema.spec.maxModelLen),
+                       "--gpu-memory-utilization", "0.9",
+                       "--kv-transfer-config", '{"kv_connector":"NixlConnector","kv_role":"kv_both"}',
+                       "--port", "8200",
+                       "--disable-access-log-for-endpoints=/health,/metrics,/v1/models"]
+                    + (schema.spec.?toolCallParser.orValue("") != "" ? ["--enable-auto-tool-choice", "--tool-call-parser", schema.spec.?toolCallParser.orValue("")] : [])
+                    + schema.spec.?extraArgs.orValue([])}
+                  env:
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                    - name: HF_HOME
+                      value: /hf-cache
+                    - name: VLLM_NIXL_SIDE_CHANNEL_PORT
+                      value: "5600"
+                    - name: VLLM_NIXL_SIDE_CHANNEL_HOST
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: UCX_TLS
+                      value: "all"
+                  ports:
+                    # vLLM stays named `modelserver` (autoscaling Prometheus keeps
+                    # scraping it by that name) but moves to 8200 — the routing
+                    # sidecar below owns the pool-facing 8000.
+                    - name: modelserver
+                      containerPort: 8200
+                    - name: nixl
+                      containerPort: 5600
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8200
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                    failureThreshold: 80
+                  resources:
+                    requests:
+                      cpu: ${schema.spec.workerCpu}
+                      memory: ${schema.spec.workerMemory}
+                      nvidia.com/gpu: ${schema.spec.gpuCount}
+                    limits:
+                      cpu: ${schema.spec.workerCpu}
+                      memory: ${schema.spec.workerMemory}
+                      nvidia.com/gpu: ${schema.spec.gpuCount}
+                  volumeMounts:
+                    - name: hf-cache
+                      mountPath: /hf-cache
+                    - name: shm
+                      mountPath: /dev/shm
+                # Routing sidecar (DECODE pods only) — the pool-facing endpoint on
+                # 8000. Reverse-proxies to local vLLM (8200); when the EPP selects a
+                # prefill pod it sets x-prefiller-host-port and the sidecar dispatches
+                # a remote prefill (max_tokens=1) there, then decodes locally (KV
+                # pulled over NIXL). -secure-proxy=false => plain HTTP in-cluster.
+                - name: routing-sidecar
+                  image: ${schema.spec.routingSidecarImage}
+                  args:
+                    - "--port=8000"
+                    - "--vllm-port=8200"
+                    - "--kv-connector=nixlv2"
+                    - "--secure-proxy=false"
+                  ports:
+                    - name: proxy
+                      containerPort: 8000
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 35
+                    periodSeconds: 15
+                    failureThreshold: 80
+                  resources:
+                    requests:
+                      cpu: "200m"
+                      memory: 256Mi
+                    limits:
+                      memory: 512Mi
+              volumes:
+                - name: hf-cache
+                  emptyDir:
+                    sizeLimit: 100Gi
+                - name: shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 8Gi
+
+    # ── Prefill autoscaler: queue depth (compute-bound) ─────────────────────
+    - id: prefillscaledobject
+      template:
+        apiVersion: keda.sh/v1alpha1
+        kind: ScaledObject
+        metadata:
+          name: ${schema.metadata.name}-prefill
+          namespace: ${schema.metadata.namespace}
+        spec:
+          scaleTargetRef:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: ${schema.metadata.name}-prefill
+          minReplicaCount: ${schema.spec.prefillMinReplicas}
+          maxReplicaCount: ${schema.spec.prefillMaxReplicas}
+          advanced:
+            horizontalPodAutoscalerConfig:
+              behavior:
+                scaleUp:
+                  stabilizationWindowSeconds: 30
+                  policies:
+                    - type: Pods
+                      value: 2
+                      periodSeconds: 60
+                scaleDown:
+                  stabilizationWindowSeconds: 300
+                  policies:
+                    - type: Pods
+                      value: 1
+                      periodSeconds: 120
+          triggers:
+            # Prefill is compute-bound: prompts queue when prefill throughput is
+            # saturated. Scale on the prefill pool's vLLM queue depth. Smoothed
+            # (max_over_time) + block scalar for scrape-gap and SSA robustness.
+            - type: prometheus
+              metricType: AverageValue
+              metadata:
+                serverAddress: http://autoscaling-prometheus.inference.svc.cluster.local:9090
+                query: |-
+                  sum(max_over_time(vllm:num_requests_waiting{pool="${schema.metadata.name}",role="prefill"}[1m])) or vector(0)
+                threshold: "${string(schema.spec.prefillTargetQueueDepth)}"
+                activationThreshold: "1"
+
+    # ── Decode autoscaler: KV-cache utilization (memory/bandwidth-bound) ─────
+    - id: decodescaledobject
+      template:
+        apiVersion: keda.sh/v1alpha1
+        kind: ScaledObject
+        metadata:
+          name: ${schema.metadata.name}-decode
+          namespace: ${schema.metadata.namespace}
+        spec:
+          scaleTargetRef:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: ${schema.metadata.name}-decode
+          minReplicaCount: ${schema.spec.decodeMinReplicas}
+          maxReplicaCount: ${schema.spec.decodeMaxReplicas}
+          advanced:
+            horizontalPodAutoscalerConfig:
+              behavior:
+                scaleUp:
+                  stabilizationWindowSeconds: 30
+                  policies:
+                    - type: Pods
+                      value: 2
+                      periodSeconds: 60
+                scaleDown:
+                  stabilizationWindowSeconds: 300
+                  policies:
+                    - type: Pods
+                      value: 1
+                      periodSeconds: 120
+          triggers:
+            # Decode is KV-cache-capacity/bandwidth-bound: it saturates when the
+            # KV cache fills (can't admit more concurrent sequences) — the leading
+            # indicator, ahead of the queue. vllm:kv_cache_usage_perc is a 0-1
+            # fraction; *100 makes the AverageValue target an intuitive percent.
+            # avg_over_time smooths the gauge + is scrape-gap safe.
+            - type: prometheus
+              metricType: AverageValue
+              metadata:
+                serverAddress: http://autoscaling-prometheus.inference.svc.cluster.local:9090
+                query: |-
+                  sum(avg_over_time(vllm:kv_cache_usage_perc{pool="${schema.metadata.name}",role="decode"}[1m])) * 100 or vector(0)
+                threshold: "${string(schema.spec.decodeTargetKvCachePct)}"
+                activationThreshold: "1"
+
+    # ── llm-d router: EPP + InferencePool over BOTH role-labeled pools ───────
+    - id: routerapp
+      readyWhen:
+        - ${routerapp.status.?health.?status.orValue('') == "Healthy"}
+      template:
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: ${schema.metadata.name}-llmd-router
+          namespace: argocd
+          finalizers:
+            - resources-finalizer.argocd.argoproj.io
+        spec:
+          project: default
+          source:
+            repoURL: ghcr.io/llm-d/charts
+            chart: llm-d-router-standalone
+            targetRevision: ${schema.spec.routerChartVersion}
+            helm:
+              releaseName: ${schema.metadata.name}
+              valuesObject:
+                router:
+                  epp:
+                    replicas: 1
+                    flags:
+                      v: 2
+                    pluginsConfigFile: "disagg-plugins.yaml"
+                    pluginsCustomConfig:
+                      disagg-plugins.yaml: |
+                        apiVersion: llm-d.ai/v1alpha1
+                        kind: EndpointPickerConfig
+                        plugins:
+                        - type: prefill-filter
+                        - type: decode-filter
+                        - type: queue-scorer
+                        - type: kv-cache-utilization-scorer
+                        - type: prefix-cache-scorer
+                        - type: max-score-picker
+                        # PD deciders: both instantiated; the handler references one
+                        # (pdDisaggregation). prefix-based ships as the default.
+                        - type: prefix-based-pd-decider
+                          parameters:
+                            nonCachedTokens: ${string(schema.spec.pdNonCachedTokens)}
+                        - type: always-disagg-pd-decider
+                        # Entry point for P/D: decode-first, then the decider decides
+                        # whether to also pick a prefill pod (remote prefill via the
+                        # decode sidecar's x-prefiller-host-port).
+                        - type: disagg-profile-handler
+                          parameters:
+                            deciders:
+                              prefill: ${schema.spec.pdDisaggregation == 'always' ? 'always-disagg-pd-decider' : 'prefix-based-pd-decider'}
+                        schedulingProfiles:
+                        # Decode profile runs first: selects the decode pod that serves
+                        # + owns the session, scored on KV/prefix/queue.
+                        - name: decode
+                          plugins:
+                          - pluginRef: decode-filter
+                          - pluginRef: queue-scorer
+                            weight: ${string(schema.spec.routingProfile == 'throughput' ? 3 : (schema.spec.routingProfile == 'latency' ? 4 : (schema.spec.routingProfile == 'prefix' ? 1 : 2)))}
+                          - pluginRef: kv-cache-utilization-scorer
+                            weight: ${string(schema.spec.routingProfile == 'latency' ? 1 : (schema.spec.routingProfile == 'balanced' ? 2 : 3))}
+                          - pluginRef: prefix-cache-scorer
+                            weight: ${string(schema.spec.routingProfile == 'prefix' ? 4 : (schema.spec.routingProfile == 'throughput' ? 1 : (schema.spec.routingProfile == 'latency' ? 2 : 3)))}
+                          - pluginRef: max-score-picker
+                        # Prefill profile (chosen when the decider warrants remote
+                        # prefill): prefix-cache-aware so shared prefixes reuse a prefiller.
+                        - name: prefill
+                          plugins:
+                          - pluginRef: prefill-filter
+                          - pluginRef: prefix-cache-scorer
+                            weight: ${string(schema.spec.routingProfile == 'prefix' ? 4 : 2)}
+                          - pluginRef: max-score-picker
+                  inferencePool:
+                    failureMode: "FailOpen"
+                  modelServers:
+                    protocol: http
+                    matchLabels:
+                      llm-d.ai/pool: ${schema.metadata.name}
+                  extraServicePorts:
+                    - name: http
+                      port: 80
+                      protocol: TCP
+                      targetPort: 8081
+                  proxy:
+                    args:
+                      - "--service-node"
+                      - "envoy-sidecar"
+                      - "--log-level"
+                      - "warn"
+                      - "--concurrency"
+                      - "4"
+                      - "-c"
+                      - "/etc/envoy/envoy.yaml"
+                    resources:
+                      requests:
+                        cpu: "1"
+                        memory: 2Gi
+                      limits:
+                        memory: 4Gi
+          destination:
+            name: local-cluster
+            namespace: ${schema.metadata.namespace}
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+              - ServerSideApply=true

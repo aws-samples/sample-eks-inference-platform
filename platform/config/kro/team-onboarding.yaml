@@ -1,0 +1,472 @@
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: team-onboarding
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: AITeam
+    # NOTE: the teamName/maxBudget fields below carry validation markers (pattern)
+    # so bad input is rejected at admission instead of failing deep inside the
+    # onboarding Job. Adding validation to an existing CRD is a tightening change
+    # KRO may refuse in place on a cluster that predates it — if the RGD goes
+    # Inactive after this change, recreate the CRD once when no AITeams are live
+    # (KRO rebuilds it): kubectl delete crd aiteams.kro.run
+    spec:
+      # teamName is ALSO the team-<teamName> namespace name, so it must be a
+      # DNS-1123 label. The pattern rejects invalid names at admission rather than
+      # letting namespace creation fail later with a cryptic error. (<=40 chars.)
+      teamName:       'string | required=true pattern="^[a-z0-9]([a-z0-9-]{0,38}[a-z0-9])?$"'
+      models:         "[]string | default=[\"*\"]"      # Allowed model names (* = all models)
+      # Numeric string: the onboarding Job feeds this to `jq --argjson budget`,
+      # which needs valid JSON — a non-numeric value crash-loops the Job. The
+      # pattern enforces a number (e.g. 100 or 100.0) at admission.
+      maxBudget:      'string | default=100.0 pattern="^[0-9]+(\.[0-9]+)?$"'
+      budgetDuration: "string | default=30d"            # Budget reset period (1d, 7d, 30d)
+      rpmLimit:       "integer | default=100"           # Requests per minute
+      tpmLimit:       "integer | default=100000"        # Tokens per minute
+      cpuQuota:       "string | default=4"              # CPU quota for team namespace
+      memoryQuota:    "string | default=8Gi"            # Memory quota for team namespace
+      gpuQuota:       "integer | default=0"             # GPU quota for team namespace (0 = API-only team)
+      # DEPRECATED — ignored by the onboarding job. Do NOT put secret values in
+      # the spec: an AITeam is committed to git, so keys here would be exposed.
+      # Use `langfuseSecretName` instead. Retained (not removed) only to avoid a
+      # breaking CRD change; slated for removal in a future migration.
+      langfusePublicKey:  "string | default="
+      langfuseSecretKey:  "string | default="
+      # Name of a Secret in the `ai-platform` namespace holding this team's
+      # Langfuse project keys under data keys `public-key` and `secret-key`.
+      # Optional — leave as "none" (default) to skip per-team Langfuse routing.
+      langfuseSecretName: "string | default=none"
+    status:
+      namespace:      "${teamNamespace.metadata.name}"
+      apiKeySecret:   "${serviceaccount.metadata.name}-api-key"
+
+  resources:
+
+    # --- Namespace ---
+    - id: teamNamespace
+      template:
+        apiVersion: v1
+        kind: Namespace
+        metadata:
+          name: team-${schema.spec.teamName}
+          labels:
+            app.kubernetes.io/part-of: ai-platform
+            ai-platform/team: ${schema.spec.teamName}
+            ai-platform/managed-by: kro
+            # Pod Security Standards for tenant namespaces. `baseline` is
+            # ENFORCED (blocks privileged pods, host namespaces, hostPath, added
+            # capabilities — the container-escape primitives) while `restricted`
+            # is surfaced via warn/audit. Enforce stops at baseline deliberately:
+            # bumping enforce to `restricted` requires every serving pod
+            # (VLLMEndpoint/LLMDEndpoint) to carry a compliant securityContext;
+            # once those pod specs are hardened, raise this to restricted.
+            pod-security.kubernetes.io/enforce: baseline
+            pod-security.kubernetes.io/warn: restricted
+            pod-security.kubernetes.io/audit: restricted
+
+    # --- Resource Quota ---
+    - id: resourcequota
+      template:
+        apiVersion: v1
+        kind: ResourceQuota
+        metadata:
+          name: team-quota
+          namespace: team-${schema.spec.teamName}
+        spec:
+          hard:
+            requests.cpu: ${schema.spec.cpuQuota}
+            requests.memory: ${schema.spec.memoryQuota}
+            limits.cpu: ${schema.spec.cpuQuota}
+            limits.memory: ${schema.spec.memoryQuota}
+            nvidia.com/gpu: ${string(schema.spec.gpuQuota)}
+            pods: "20"
+            services: "10"
+            persistentvolumeclaims: "5"
+
+    # --- Limit Range ---
+    # The ResourceQuota above enforces limits.cpu/limits.memory, which means K8s
+    # rejects any pod that doesn't set explicit resource limits. This LimitRange
+    # supplies per-container defaults so a team's normal manifests schedule
+    # without every container having to declare requests/limits by hand.
+    - id: limitrange
+      template:
+        apiVersion: v1
+        kind: LimitRange
+        metadata:
+          name: team-defaults
+          namespace: team-${schema.spec.teamName}
+        spec:
+          limits:
+            - type: Container
+              default:
+                cpu: "500m"
+                memory: 512Mi
+              defaultRequest:
+                cpu: 100m
+                memory: 128Mi
+
+    # --- Network Policy ---
+    # Isolation is enforced on INGRESS (the receiving side), which is what makes
+    # it robust: for team-A to reach team-B, team-B's ingress must admit team-A —
+    # and it does not. So cross-team traffic is blocked no matter what team-A
+    # sends. Ingress is admitted ONLY from:
+    #   - this team's own namespace (ai-platform/team=<name>), and
+    #   - the platform namespaces (ai-platform, inference), so the LiteLLM
+    #     gateway can route to this team's models and monitoring can scrape them.
+    # It is NOT admitted from other teams (they no longer share a selector) or
+    # from the internet.
+    #
+    # Egress is intentionally left open: team model pods must pull weights from
+    # S3 (VPC endpoint) and Hugging Face at startup, which an in-cluster-only
+    # egress allowlist would break. Reaching another team is still blocked by
+    # that team's ingress, and reaching the platform Postgres is blocked by the
+    # platform-db policy (litellm.yaml). Locking egress down further (explicit
+    # S3/HF/DNS allowlist) is a documented hardening follow-up, not a default,
+    # because it is fork-specific (endpoints/regions differ).
+    #
+    # NOTE: NetworkPolicy is only enforced because the VPC CNI addon sets
+    # enableNetworkPolicy=true (terraform 30.cluster/main.tf) / Auto Mode's
+    # NodeClass networkPolicy field. Without that this policy is inert.
+    - id: networkpolicy
+      template:
+        apiVersion: networking.k8s.io/v1
+        kind: NetworkPolicy
+        metadata:
+          name: team-default
+          namespace: team-${schema.spec.teamName}
+        spec:
+          podSelector: {}
+          policyTypes:
+            - Ingress
+          ingress:
+            # Same team.
+            - from:
+                - namespaceSelector:
+                    matchLabels:
+                      ai-platform/team: ${schema.spec.teamName}
+            # Platform namespaces (LiteLLM gateway routing + monitoring scrape).
+            # Selected by the immutable, Kubernetes-guaranteed name label so it
+            # does not depend on any custom labelling of those namespaces.
+            - from:
+                - namespaceSelector:
+                    matchExpressions:
+                      - key: kubernetes.io/metadata.name
+                        operator: In
+                        values:
+                          - ai-platform
+                          - inference
+
+    # --- RBAC ---
+    - id: serviceaccount
+      template:
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: team-${schema.spec.teamName}
+          namespace: team-${schema.spec.teamName}
+          labels:
+            ai-platform/team: ${schema.spec.teamName}
+
+    - id: rolebinding
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: team-developer
+          namespace: team-${schema.spec.teamName}
+        subjects:
+          - kind: ServiceAccount
+            name: team-${schema.spec.teamName}
+            namespace: team-${schema.spec.teamName}
+        roleRef:
+          kind: ClusterRole
+          name: team-developer
+          apiGroup: rbac.authorization.k8s.io
+
+    # --- Per-team secret-writer Role + binding for the onboarding SA ---
+    # Grants the team-onboarding ServiceAccount (in ai-platform) permission to
+    # write ONLY this team's scoped API key Secret into its namespace. Previously
+    # this bound a cluster-wide ClusterRole with unrestricted secrets get/create/
+    # update/patch, so within the team namespace the onboarding SA could read or
+    # modify ANY secret (e.g. a team's own hf-token). This per-team Role scopes
+    # get/update/patch to the <team>-api-key object by name; `create` can't carry
+    # resourceNames in RBAC, but as a namespaced Role its blast radius is just
+    # this one namespace. The master key never enters the team namespace.
+    - id: onboardingSecretRole
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata:
+          name: team-onboarding-secret-writer
+          namespace: team-${schema.spec.teamName}
+        rules:
+          - apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create"]
+          - apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get", "update", "patch"]
+            resourceNames: ["${schema.spec.teamName}-api-key"]
+    - id: onboardingRolebinding
+      template:
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: team-onboarding
+          namespace: team-${schema.spec.teamName}
+        subjects:
+          - kind: ServiceAccount
+            name: team-onboarding
+            namespace: ai-platform
+        roleRef:
+          kind: Role
+          name: team-onboarding-secret-writer
+          apiGroup: rbac.authorization.k8s.io
+
+    # --- Onboarding Job ---
+    # Runs in the ai-platform namespace with a platform-owned ServiceAccount.
+    # Calls LiteLLM API to create the team + scoped API key, writes the
+    # resulting key as a Secret into the team namespace. Idempotent: finds
+    # existing team by alias, updates settings on re-sync.
+    - id: onboardingjob
+      template:
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: onboard-${schema.spec.teamName}
+          namespace: ai-platform
+        spec:
+          backoffLimit: 10
+          # A Job's pod template is immutable, so once this Job exists an edit to
+          # the AITeam spec (e.g. a new maxBudget) can't update it and KRO's
+          # re-apply would conflict — wedging the AITeam. TTL-GC the finished Job
+          # so the next reconcile re-creates it cleanly with the new settings.
+          # (The onboarding script is idempotent, so re-running is safe.)
+          ttlSecondsAfterFinished: 300
+          template:
+            metadata:
+              labels:
+                ai-platform/team: ${schema.spec.teamName}
+                ai-platform/job: onboarding
+            spec:
+              restartPolicy: OnFailure
+              serviceAccountName: team-onboarding
+              containers:
+                - name: onboard
+                  image: alpine/k8s:1.35.6
+                  command: ["bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      LITELLM="http://litellm.ai-platform.svc.cluster.local:4000"
+                      MODELS_JSON=$(echo "$MODELS_CSV" | jq -R 'split(",")')
+
+                      # --- Wait for LiteLLM ---
+                      echo "Waiting for LiteLLM..."
+                      until curl -sf "$LITELLM/health/liveliness" > /dev/null 2>&1; do sleep 5; done
+
+                      # --- Create or update Team ---
+                      TEAM_ID=$(curl -sf "$LITELLM/team/list" \
+                        -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+                        | jq -r ".[] | select(.team_alias==\"$TEAM_NAME\") | .team_id // empty" \
+                        | head -1)
+
+                      if [ -n "$TEAM_ID" ]; then
+                        echo "Team exists ($TEAM_ID), updating settings..."
+                        curl -sf -X POST "$LITELLM/team/update" \
+                          -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+                          -H "Content-Type: application/json" \
+                          -d "$(jq -n \
+                            --arg id "$TEAM_ID" \
+                            --argjson models "$MODELS_JSON" \
+                            --argjson budget "$MAX_BUDGET" \
+                            --arg duration "$BUDGET_DURATION" \
+                            --argjson tpm "$TPM_LIMIT" \
+                            --argjson rpm "$RPM_LIMIT" \
+                            '{team_id:$id, models:$models, max_budget:$budget,
+                              budget_duration:$duration, tpm_limit:$tpm, rpm_limit:$rpm}')" \
+                          > /dev/null
+                      else
+                        echo "Creating team..."
+                        TEAM_ID=$(curl -sf -X POST "$LITELLM/team/new" \
+                          -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+                          -H "Content-Type: application/json" \
+                          -d "$(jq -n \
+                            --arg alias "$TEAM_NAME" \
+                            --argjson models "$MODELS_JSON" \
+                            --argjson budget "$MAX_BUDGET" \
+                            --arg duration "$BUDGET_DURATION" \
+                            --argjson tpm "$TPM_LIMIT" \
+                            --argjson rpm "$RPM_LIMIT" \
+                            --arg ns "team-$TEAM_NAME" \
+                            '{team_alias:$alias, models:$models, max_budget:$budget,
+                              budget_duration:$duration, tpm_limit:$tpm, rpm_limit:$rpm,
+                              metadata:{managed_by:"kro", namespace:$ns}}')" \
+                          | jq -r '.team_id')
+
+                        [ -n "$TEAM_ID" ] && [ "$TEAM_ID" != "null" ] || { echo "ERROR: team creation failed"; exit 1; }
+                        echo "Team created: $TEAM_ID"
+                      fi
+
+                      # --- Generate scoped API key (skip if already exists) ---
+                      EXISTING_KEY=$(kubectl get secret "$TEAM_NAME-api-key" \
+                        --namespace="$NAMESPACE" \
+                        -o jsonpath='{.data.api-key}' 2>/dev/null | base64 -d || true)
+
+                      if [ -n "$EXISTING_KEY" ]; then
+                        echo "API key secret already exists. Skipping key generation."
+                        API_KEY="$EXISTING_KEY"
+                      else
+                        API_KEY=$(curl -sf -X POST "$LITELLM/key/generate" \
+                          -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+                          -H "Content-Type: application/json" \
+                          -d "$(jq -n \
+                            --arg id "$TEAM_ID" \
+                            --arg alias "$TEAM_NAME-kro-managed" \
+                            --argjson models "$MODELS_JSON" \
+                            --arg team "$TEAM_NAME" \
+                            '{team_id:$id, key_alias:$alias, models:$models,
+                              metadata:{managed_by:"kro", team_alias:$team}}')" \
+                          | jq -r '.key')
+
+                        [ -n "$API_KEY" ] && [ "$API_KEY" != "null" ] || { echo "ERROR: key generation failed"; exit 1; }
+                      fi
+
+                      # --- Store credentials as a Secret ---
+                      kubectl create secret generic "$TEAM_NAME-api-key" \
+                        --namespace="$NAMESPACE" \
+                        --from-literal=api-key="$API_KEY" \
+                        --from-literal=team-id="$TEAM_ID" \
+                        --from-literal=litellm-endpoint="$LITELLM" \
+                        --dry-run=client -o yaml \
+                        | kubectl label --local -f - \
+                            ai-platform/team="$TEAM_NAME" \
+                            ai-platform/managed-by=kro \
+                            -o yaml --dry-run=client \
+                        | kubectl apply -f -
+
+                      # --- Configure per-team Langfuse project (optional) ---
+                      # LANGFUSE_* come from an optional Secret and may be unset.
+                      # Relax nounset for the presence check; brace-default
+                      # parameter expansion would collide with KRO interpolation.
+                      set +u
+                      if [ -n "$LANGFUSE_PK" ] && [ -n "$LANGFUSE_SK" ]; then
+                        echo "Configuring Langfuse callback for team..."
+                        curl -sf -X POST "$LITELLM/team/$TEAM_ID/callback" \
+                          -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+                          -H "Content-Type: application/json" \
+                          -d "$(jq -n \
+                            --arg pk "$LANGFUSE_PK" \
+                            --arg sk "$LANGFUSE_SK" \
+                            '{callback_name:"langfuse", callback_type:"success_and_failure",
+                              callback_vars:{langfuse_public_key:$pk, langfuse_secret_key:$sk,
+                              langfuse_host:"http://langfuse-web.ai-platform.svc.cluster.local:3000"}}')" \
+                          > /dev/null && echo "✓ Langfuse callback configured" || echo "⚠ Langfuse callback failed (non-blocking)"
+                      fi
+                      set -u
+
+                      echo ""
+                      echo "=== Team '$TEAM_NAME' onboarded ==="
+                      echo "  Namespace:  $NAMESPACE"
+                      echo "  Secret:     $TEAM_NAME-api-key"
+                      echo "  Budget:     \$$MAX_BUDGET / $BUDGET_DURATION"
+                      echo "  Rate limit: $RPM_LIMIT rpm, $TPM_LIMIT tpm"
+                  env:
+                    - name: LITELLM_MASTER_KEY
+                      valueFrom:
+                        secretKeyRef:
+                          name: litellm-secrets
+                          key: master-key
+                    - name: TEAM_NAME
+                      value: ${schema.spec.teamName}
+                    - name: NAMESPACE
+                      value: team-${schema.spec.teamName}
+                    - name: MODELS_CSV
+                      value: ${schema.spec.models.join(",")}
+                    - name: MAX_BUDGET
+                      value: ${schema.spec.maxBudget}
+                    - name: BUDGET_DURATION
+                      value: ${schema.spec.budgetDuration}
+                    - name: TPM_LIMIT
+                      value: ${string(schema.spec.tpmLimit)}
+                    - name: RPM_LIMIT
+                      value: ${string(schema.spec.rpmLimit)}
+                    - name: LANGFUSE_PK
+                      valueFrom:
+                        secretKeyRef:
+                          name: ${schema.spec.langfuseSecretName}
+                          key: public-key
+                          optional: true
+                    - name: LANGFUSE_SK
+                      valueFrom:
+                        secretKeyRef:
+                          name: ${schema.spec.langfuseSecretName}
+                          key: secret-key
+                          optional: true
+                  resources:
+                    requests:
+                      cpu: 50m
+                      memory: 32Mi
+                    limits:
+                      cpu: 100m
+                      memory: 64Mi
+
+    # --- Welcome ConfigMap with usage instructions ---
+    - id: welcome
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: welcome
+          namespace: team-${schema.spec.teamName}
+          labels:
+            ai-platform/team: ${schema.spec.teamName}
+            ai-platform/managed-by: kro
+        data:
+          README.md: |
+            # Team: ${schema.spec.teamName}
+
+            ## Quick Start
+
+            Get your API key:
+              kubectl get secret ${schema.spec.teamName}-api-key -n team-${schema.spec.teamName} \
+                -o jsonpath='{.data.api-key}' | base64 -d
+
+            Test a model:
+              export API_KEY=$(kubectl get secret ${schema.spec.teamName}-api-key -n team-${schema.spec.teamName} -o jsonpath='{.data.api-key}' | base64 -d)
+              curl http://litellm.ai-platform.svc.cluster.local:4000/v1/chat/completions \
+                -H "Authorization: Bearer $API_KEY" \
+                -H "Content-Type: application/json" \
+                -d '{"model": "${size(schema.spec.models) > 0 ? schema.spec.models[0] : "<none-allowed>"}", "messages": [{"role": "user", "content": "Hello!"}]}'
+
+            ## Your Configuration
+
+            - Namespace:  team-${schema.spec.teamName}
+            - Models:     ${schema.spec.models.join(", ")}
+            - Budget:     $${schema.spec.maxBudget} / ${schema.spec.budgetDuration}
+            - Rate limit: ${string(schema.spec.rpmLimit)} rpm, ${string(schema.spec.tpmLimit)} tpm
+
+            ## Deploy your own model (GitOps)
+
+            Commit a VLLMEndpoint YAML under your team's models directory and push:
+
+              workloads/models/team-${schema.spec.teamName}/<model>.yaml
+
+            The directory name is your namespace — the model deploys into
+            team-${schema.spec.teamName} (this team's GPU quota, RBAC, and scoped
+            key). Do NOT set metadata.namespace in the YAML. Copy
+            workloads/models/TEMPLATE.yaml.example as a starting point; see
+            workloads/models/README.md. For the llm-d scale/disaggregation tiers,
+            use workloads/scale-models/.
+
+            ## Access
+
+            - API endpoint: http://litellm.ai-platform.svc.cluster.local:4000
+            - API key secret: ${schema.spec.teamName}-api-key (in this namespace)
+            - Open WebUI / LiteLLM / Langfuse UIs: via `./platformctl tunnel`
+
+            ## View this file
+
+              kubectl get configmap welcome -n team-${schema.spec.teamName} -o jsonpath='{.data.README\.md}'

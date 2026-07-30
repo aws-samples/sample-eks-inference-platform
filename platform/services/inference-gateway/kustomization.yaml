@@ -1,0 +1,16 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Gateway API Inference Extension (GIE) CRDs, pulled from upstream at a PINNED
+# tag. ArgoCD auto-detects this kustomization.yaml for the `inference-gateway`
+# app (see argocd/bootstrap/templates/platform.yaml) and runs `kustomize build`
+# at sync time to fetch and install the CRDs. They stay GitOps-managed (synced,
+# and pruned on teardown). To upgrade, bump the `?ref=` tag below.
+#
+# The four CRDs this resolves to (InferenceModelRewrite, InferenceObjective,
+# InferencePoolImport, InferencePool) are the substrate the llm-d scale tier
+# (LLMDEndpoint) needs; standalone-mode llm-d requires only these CRDs — no
+# shared Envoy Gateway.
+resources:
+  - https://github.com/kubernetes-sigs/gateway-api-inference-extension/config/crd?ref=v1.5.0
+  - repo-secret.yaml

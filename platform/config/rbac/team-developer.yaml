@@ -1,0 +1,37 @@
+# ClusterRole: team-developer
+# Provides namespace-scoped developer permissions for team members.
+# Bound per-namespace via RoleBinding created by the AITeam KRO definition.
+# This is a one-time platform bootstrap resource.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: team-developer
+  labels:
+    app.kubernetes.io/part-of: ai-platform
+    ai-platform/managed-by: platform-team
+rules:
+  # Core workload management
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/exec", "services", "configmaps", "secrets", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Networking
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  # Events (read-only for debugging)
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # KRO serving endpoints — read-only.
+  # Teams deploy models via git (workloads/models/team-<name>/, synced by ArgoCD)
+  # and can see their status in their namespace, but don't create/modify the CRs
+  # directly (that's the GitOps path).
+  - apiGroups: ["kro.run"]
+    resources: ["vllmendpoints", "llmdendpoints", "llmddisaggendpoints"]
+    verbs: ["get", "list", "watch"]

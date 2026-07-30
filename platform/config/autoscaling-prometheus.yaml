@@ -1,0 +1,143 @@
+# Autoscaling Prometheus — a small, always-on Prometheus dedicated to KEDA
+# replica autoscaling of the llm-d serving tier. Deliberately NOT the optional
+# 40.observability stack: the default serving tier's elasticity must not depend
+# on observability being enabled.
+#
+# Scope: scrapes only the `inference` namespace, discovering llm-d model-server
+# pods by the `llm-d.ai/pool` label on their `modelserver` port (8000) — so it
+# picks up vLLM saturation metrics (vllm:num_requests_waiting, kv_cache_usage)
+# with no per-pod annotations. Ephemeral storage, 2h retention (KEDA only needs
+# recent values). KEDA's built-in Prometheus scaler queries the Service below.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoscaling-prometheus
+  namespace: inference
+  labels: { app.kubernetes.io/part-of: ai-platform, ai-platform/component: autoscaling }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: autoscaling-prometheus
+  namespace: inference
+  labels: { app.kubernetes.io/part-of: ai-platform, ai-platform/component: autoscaling }
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: autoscaling-prometheus
+  namespace: inference
+  labels: { app.kubernetes.io/part-of: ai-platform, ai-platform/component: autoscaling }
+subjects:
+  - kind: ServiceAccount
+    name: autoscaling-prometheus
+    namespace: inference
+roleRef:
+  kind: Role
+  name: autoscaling-prometheus
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autoscaling-prometheus-config
+  namespace: inference
+  labels: { app.kubernetes.io/part-of: ai-platform, ai-platform/component: autoscaling }
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    scrape_configs:
+      # llm-d model-server (vLLM) pods — saturation signals for KEDA.
+      - job_name: llmd-vllm
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [inference]
+        relabel_configs:
+          # keep only pods that belong to an llm-d InferencePool
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_pool]
+            action: keep
+            regex: .+
+          # scrape only the model-server port (8000), not every declared port
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            action: keep
+            regex: modelserver
+          # only Running pods
+          - source_labels: [__meta_kubernetes_pod_phase]
+            action: keep
+            regex: Running
+          # expose the pool + role + pod as query labels (KEDA filters by pool,
+          # and by role for the disaggregated prefill/decode pools)
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_pool]
+            target_label: pool
+          - source_labels: [__meta_kubernetes_pod_label_llm_d_ai_role]
+            target_label: role
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      # LiteLLM (the always-on gateway) — per-model request counters. This is
+      # the wake-from-zero signal: LiteLLM counts a request for a model before
+      # it reaches the EPP, so the counter moves even when the pool is at zero.
+      # Static target (no cross-namespace pod discovery / RBAC needed); /metrics
+      # is unauthenticated and in-cluster only.
+      - job_name: litellm
+        metrics_path: /metrics
+        static_configs:
+          - targets: ["litellm.ai-platform.svc.cluster.local:4000"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoscaling-prometheus
+  namespace: inference
+  labels: { app.kubernetes.io/name: autoscaling-prometheus, app.kubernetes.io/part-of: ai-platform, ai-platform/component: autoscaling }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: autoscaling-prometheus }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: autoscaling-prometheus, ai-platform/component: autoscaling }
+    spec:
+      serviceAccountName: autoscaling-prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.55.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=2h
+            - --web.enable-lifecycle
+          ports:
+            - { name: web, containerPort: 9090 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          readinessProbe:
+            httpGet: { path: /-/ready, port: web }
+            initialDelaySeconds: 10
+      volumes:
+        - name: config
+          configMap: { name: autoscaling-prometheus-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: autoscaling-prometheus
+  namespace: inference
+  labels: { app.kubernetes.io/name: autoscaling-prometheus, app.kubernetes.io/part-of: ai-platform, ai-platform/component: autoscaling }
+spec:
+  selector: { app.kubernetes.io/name: autoscaling-prometheus }
+  ports:
+    - { name: web, port: 9090, targetPort: web }

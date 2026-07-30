@@ -1,0 +1,61 @@
+.DS_Store
+*.swp
+*.swo
+nohup.out
+
+# Terraform
+**/.terraform/
+# .terraform.lock.hcl is committed on purpose (reproducible provider versions)
+terraform.tfstate
+terraform.tfstate.backup
+terraform.tfstate.d/
+*.tfplan
+*.tfvars
+*.tfvars.backup
+!**/example*.tfvars
+terraform/tf-logs/
+errored.tfstate
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Ops
+ops/.scale-state-*.json
+# platformctl active-env state (per checkout, per operator)
+.platformctl/
+
+# IDE / editor
+.vscode/
+.claude/settings.local.json
+
+# Agent tooling
+.agents/
+.claude/
+.kiro/
+.playwright-mcp/
+skills-lock.json
+CLAUDE.md
+
+# Build artifacts
+.next/
+
+# Local test artifacts from recommend-instance multi-model runs
+output.md
+output*.md
+
+# Internal strategy doc (kept locally, not tracked)
+docs/enterprise-ai-platform-strategy.md
+
+# Internal/pre-publication docs — kept locally, not tracked, so the public
+# aws-samples mirror never carries them.
+docs/roadmap/
+docs/blog/
+docs/security-scan.md
+
+# AWS Talos security-review engagement metadata. Untracked — kept only as a
+# local file — so the git-mirror publish never carries it to the public
+# aws-samples repo. If your Talos review runs on a fresh clone rather than your
+# local checkout, re-add it to the internal repo ONLY with `git add -f .secreview`.
+.secreview

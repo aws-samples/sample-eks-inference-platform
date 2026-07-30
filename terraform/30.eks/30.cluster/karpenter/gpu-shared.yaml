@@ -1,0 +1,130 @@
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-shared
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  metadataOptions:
+    # Hop limit 2 required so Bottlerocket's pluto (containerised) can reach
+    # IMDS to fetch the private DNS name during bootstrap.
+    httpPutResponseHopLimit: 2
+    httpTokens: required
+    httpEndpoint: enabled
+  role: ${role}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Name: ${cluster_name}-private-*
+        Environment: ${environment}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Environment: ${environment}
+  blockDeviceMappings:
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: ${gpu_volume_size}Gi
+        volumeType: gp3
+        encrypted: true
+        throughput: 500
+        iops: 6000
+        ${gpu_snapshot_id_line}
+  userData: |
+    [settings.container-runtime]
+    snapshotter = "soci"
+    # Classic SOCI lazy-loading (FUSE) — NOT `parallel-pull-unpack`. PPU panics
+    # the Bottlerocket snapshotter mid-unpack on large multi-GB-layer images
+    # (kubelet sees "reading from server: EOF"); classic SOCI + the EBS-baked
+    # content store is the stable path. See gpu-inference.yaml for the full note.
+
+    [settings.kubelet-device-plugins.nvidia]
+    device-sharing-strategy = "time-slicing"
+    [settings.kubelet-device-plugins.nvidia.time-slicing]
+    replicas = 4
+    rename-by-default = false
+  tags:
+    karpenter.sh/discovery: ${cluster_name}
+    Environment: ${environment}
+    workload-type: gpu-shared
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-shared
+spec:
+  weight: 60
+  template:
+    metadata:
+      labels:
+        workload-type: gpu-shared
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-shared
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+      # GPU time-slicing only works on single-GPU nodes: the NodeOverlay below
+      # advertises one physical GPU as 4 `nvidia.com/gpu` resources. Multi-GPU
+      # instances (g5.12xlarge, p5.48xlarge, ...) must not land here or Karpenter
+      # will fail to reconcile the advertised capacity against the scheduler view.
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["g"]
+        - key: karpenter.k8s.aws/instance-gpu-manufacturer
+          operator: In
+          values: ["nvidia"]
+        # Exclude pre-Ampere NVIDIA GPUs (T4 in g4dn). Modern vLLM model
+        # defaults use bfloat16, which requires compute capability ≥ 8.0
+        # (Ampere/Ada/Hopper). T4 is CC 7.5.
+        - key: karpenter.k8s.aws/instance-family
+          operator: NotIn
+          values: ["g4dn", "g4ad"]
+        # Numeric backstop (see gpu-inference.yaml for why the family-name list
+        # alone isn't reliable: AWS gives GPU variants their own family string,
+        # e.g. p3dn != p3). g5/g6/g6e are all generation >= 5.
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gte
+          values: ["5"]
+        - key: karpenter.k8s.aws/instance-gpu-count
+          operator: In
+          values: ["1"]
+  limits:
+    nvidia.com/gpu: "32"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 300s
+    budgets:
+      - nodes: "1"
+---
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: gpu-time-slicing
+spec:
+  weight: 10
+  requirements:
+    - key: karpenter.k8s.aws/instance-gpu-count
+      operator: In
+      values: ["1"]
+    - key: karpenter.k8s.aws/instance-gpu-manufacturer
+      operator: In
+      values: ["nvidia"]
+    - key: karpenter.sh/nodepool
+      operator: In
+      values: ["gpu-shared"]
+  capacity:
+    nvidia.com/gpu: 4

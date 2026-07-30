@@ -1,0 +1,287 @@
+# RBAC for the Platform Health Agent.
+#
+# The agent ships as a component of the cluster-dashboard app — all identities
+# live in the `ai-platform` namespace (same as the watcher + the Jobs it spawns).
+#
+# THREE distinct identities — strict least-privilege:
+#
+# 1. platform-health-agent-reader (cluster-wide read)
+#    Used by: Event Watcher, Investigator Jobs.
+#    Binding: ClusterRoleBinding (it watches/reads everywhere).
+#
+# 2. platform-health-agent-writer (scoped write)
+#    Used by: Remediator Jobs ONLY.
+#    Binding: RoleBinding per allowed namespace.
+#    Allowed namespaces: `inference` (created at install) + each `team-*` namespace.
+#    The `team-*` namespace bindings are reconciled by Event Watcher
+#    (a 5-minute periodic sweep — see scripts/event_watcher.py).
+#    NOTE: deliberately NOT bound in `ai-platform` — the agent never remediates
+#    platform services, only inference/team workloads.
+#
+# 3. platform-health-agent-spawner (create Jobs in ai-platform)
+#    Used by: cluster-dashboard backend (to create Remediator Jobs after approval),
+#             Event Watcher (to create Investigator Jobs).
+#    Binding: RoleBinding scoped to the `ai-platform` namespace only.
+#
+# What these roles deliberately do NOT grant:
+# - No write access to the serving-tier / AITeam KRO CRs (ArgoCD-managed).
+# - No write access to anything in ai-platform / gpu-operator /
+#   argocd / external-secrets / kube-system / amazon-cloudwatch (the writer
+#   ClusterRole is only ever bound in inference + team-* namespaces).
+# - No `*` verbs anywhere.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-health-agent-reader
+  namespace: ai-platform
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-health-agent-writer
+  namespace: ai-platform
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-health-agent-spawner
+  namespace: ai-platform
+---
+# READER — cluster-wide, get/list/watch only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: platform-health-agent-reader
+rules:
+  - apiGroups: [""]
+    resources:
+      - pods
+      - pods/log
+      - events
+      - nodes
+      - services
+      - persistentvolumeclaims
+      - namespaces
+      - endpoints
+      - serviceaccounts
+    # configmaps deliberately EXCLUDED from cluster-wide read: they routinely
+    # hold quasi-secrets (and kube-system's aws-auth), so a prompt-injected
+    # investigator must not be able to read every ConfigMap in the cluster. The
+    # writer role still gets namespaced configmap get/patch in inference/team-*
+    # for remediation.
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kro.run"]
+    resources: ["vllmendpoints", "llmdendpoints", "llmddisaggendpoints", "aiteams"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-health-agent-reader
+subjects:
+  - kind: ServiceAccount
+    name: platform-health-agent-reader
+    namespace: ai-platform
+roleRef:
+  kind: ClusterRole
+  name: platform-health-agent-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# WRITER — scoped via RoleBinding (NOT ClusterRoleBinding) to
+# specific namespaces only. The ClusterRole is defined here once;
+# bindings are created per-namespace by the Event Watcher's
+# `namespace_reconciler` (initial set: `inference`, then each
+# `team-*` namespace as it appears).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: platform-health-agent-writer
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]                          # restart by deletion
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "patch", "update"]          # rollout restart, image bump
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "patch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "patch"]
+  # Read-only (the remediator may need to inspect during verify).
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "events", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+---
+# Initial RoleBinding for the `inference` namespace.
+# RoleBindings for `team-*` namespaces are created at runtime by
+# the Event Watcher's namespace reconciler.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-health-agent-writer
+  namespace: inference
+  labels:
+    app.kubernetes.io/part-of: platform-health-agent
+    app.kubernetes.io/managed-by: platform-health-agent-reconciler
+subjects:
+  - kind: ServiceAccount
+    name: platform-health-agent-writer
+    namespace: ai-platform
+roleRef:
+  kind: ClusterRole
+  name: platform-health-agent-writer
+  apiGroup: rbac.authorization.k8s.io
+---
+# SPAWNER — cluster-dashboard backend + Event Watcher need to create Jobs
+# in the ai-platform namespace, plus manage RoleBindings in `team-*`
+# namespaces (Event Watcher's reconciler).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: platform-health-agent-spawner
+  namespace: ai-platform
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-health-agent-spawner-handler
+  namespace: ai-platform
+subjects:
+  - kind: ServiceAccount
+    name: platform-health-agent-spawner
+    namespace: ai-platform
+roleRef:
+  kind: Role
+  name: platform-health-agent-spawner
+  apiGroup: rbac.authorization.k8s.io
+---
+# Event Watcher gets BOTH reader (cluster-wide) and spawner (in ai-platform).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-health-agent-spawner-watcher
+  namespace: ai-platform
+subjects:
+  - kind: ServiceAccount
+    name: platform-health-agent-reader        # event-watcher uses the reader SA
+    namespace: ai-platform
+roleRef:
+  kind: Role
+  name: platform-health-agent-spawner
+  apiGroup: rbac.authorization.k8s.io
+---
+# The cluster-dashboard ServiceAccount (in ai-platform) creates Remediator Jobs
+# after an operator clicks Approve, so it also needs the spawner Role.
+# (Previously a separate cluster-dashboard-approvals Role in the dashboard
+# manifests — folded in here now that everything shares the ai-platform ns.)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: platform-health-agent-spawner-dashboard
+  namespace: ai-platform
+subjects:
+  - kind: ServiceAccount
+    name: cluster-dashboard
+    namespace: ai-platform
+roleRef:
+  kind: Role
+  name: platform-health-agent-spawner
+  apiGroup: rbac.authorization.k8s.io
+---
+# Event Watcher also needs to create/delete RoleBindings cluster-wide
+# (for its team-* namespace reconciler).
+# This is a separate ClusterRole bound only to the reader SA.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: platform-health-agent-rolebinding-manager
+rules:
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["get", "list", "create", "delete", "watch"]
+    # NOTE: no `update`/`patch` — bindings are immutable from our POV.
+  # K8s RBAC privilege-escalation rule: to create a RoleBinding granting
+  # `platform-health-agent-writer`, the creator must EITHER hold all those write
+  # permissions itself OR have explicit `bind` permission on that
+  # ClusterRole. We use the latter — surgical, no permission expansion.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["bind"]
+    resourceNames: ["platform-health-agent-writer"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-health-agent-rolebinding-manager
+subjects:
+  - kind: ServiceAccount
+    name: platform-health-agent-reader
+    namespace: ai-platform
+roleRef:
+  kind: ClusterRole
+  name: platform-health-agent-rolebinding-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+# Admission guardrail: the rolebinding-manager grant above is cluster-wide
+# (RBAC can't scope create-in-arbitrary-namespace to a namespace pattern, and
+# team-* namespaces appear dynamically). This ValidatingAdmissionPolicy bounds
+# it at admission: the PHA reader SA (the event-watcher identity) may only
+# create/delete RoleBindings in 'inference' or 'team-*' namespaces. Without it,
+# a compromised watcher could bind the writer role into kube-system/ai-platform
+# and escalate. Scoped by matchConditions to ONLY that SA, so all other
+# RoleBinding traffic is untouched; failurePolicy: Fail = fail-closed.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: pha-rolebinding-scope
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["rbac.authorization.k8s.io"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "DELETE"]
+        resources: ["rolebindings"]
+  matchConditions:
+    - name: only-pha-reader
+      expression: "request.userInfo.username == 'system:serviceaccount:ai-platform:platform-health-agent-reader'"
+  validations:
+    # Namespaced resource → request.namespace is populated on CREATE and DELETE.
+    - expression: "request.namespace.matches('^(inference|team-.+)$')"
+      message: "Platform Health Agent may only manage RoleBindings in the 'inference' or 'team-*' namespaces."
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: pha-rolebinding-scope
+spec:
+  policyName: pha-rolebinding-scope
+  validationActions: ["Deny"]

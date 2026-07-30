@@ -1,0 +1,39 @@
+# LLMDDisaggEndpoint Template — the scale + performance tier: llm-d with
+# prefill/decode DISAGGREGATION. Copy this file, rename it to your model name
+# (e.g. qwen3-32b-disagg.yaml), and fill in spec.model. Only 'model' is required.
+#
+# Use this over LLMDEndpoint when you need to scale the compute-bound prefill and
+# the KV-cache/bandwidth-bound decode phases INDEPENDENTLY: the two run as
+# separate vLLM pools, each autoscaled on its own signal (prefill on queue depth,
+# decode on KV-cache utilization), with llm-d routing across them behind the same
+# LiteLLM /v1 API.
+#
+# The llm-d substrate (GIE CRDs + the llm-d OCI Helm repo registered in ArgoCD)
+# ships on every cluster via the `inference-gateway` platform app — no toggle.
+#
+# After committing, ArgoCD syncs automatically. Track progress with:
+#   kubectl get llmddisaggendpoints -n inference -w
+#   kubectl get application <name>-llmd-router -n argocd    # the router (EPP+InferencePool)
+apiVersion: kro.run/v1alpha1
+kind: LLMDDisaggEndpoint
+metadata:
+  name: my-disagg-model       # Also becomes the LiteLLM model name for API calls
+  namespace: inference
+spec:
+  model: "org/model-id"       # REQUIRED — HuggingFace model ID (e.g. Qwen/Qwen3-32B)
+  # gpuCount: 1               # GPUs per replica (tensor parallelism). 1, 2, 4, or 8.
+  # tensorParallelSize: 0     # 0 = use gpuCount; set explicitly to override
+  # maxModelLen: 16384        # Max sequence length. Lower = less GPU memory.
+  #
+  # --- Prefill pool (compute-bound) — autoscaled on queue depth ---
+  # prefillMinReplicas: 1          # floor (>=1; scale-to-zero parked)
+  # prefillMaxReplicas: 2          # ceiling; > min enables autoscaling
+  # prefillTargetQueueDepth: 20    # per-pod vllm:num_requests_waiting target
+  #
+  # --- Decode pool (KV-cache/bandwidth-bound) — autoscaled on KV-cache usage ---
+  # decodeMinReplicas: 1           # floor (>=1)
+  # decodeMaxReplicas: 4           # ceiling; > min enables autoscaling
+  # decodeTargetKvCachePct: 85     # target avg vllm:kv_cache_usage_perc (%)
+#
+# Unsure what size GPU / how many GPUs your model needs?
+# Run: ./platformctl new-model org/model-id --seq 16384 --users 8

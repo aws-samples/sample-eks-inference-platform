@@ -1,0 +1,100 @@
+# Configuration ConfigMap for the Platform Health Agent.
+#
+# Mounted as env vars on event-watcher and inherited by every
+# Investigator/Remediator Job it spawns. The cluster-dashboard
+# (which hosts the approvals UI) reads APPROVAL_EXPIRY_HOURS via
+# its own ConfigMap or hardcoded default.
+#
+# To change config:
+# - Edit values here, push, ArgoCD applies.
+# - Kustomize rolls the ConfigMap (hash suffix changes), Deployments
+#   pick up new env vars automatically (pod restart).
+# - In-flight Jobs keep the env they were spawned with — no harm.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-health-agent-config
+  namespace: ai-platform
+data:
+  # Cluster identity (used in kiro-cli prompts + EKS MCP AWS-API tool calls).
+  # SET THESE to your cluster: CLUSTER_NAME is <resources_prefix>-<environment>
+  # (see terraform locals), AWS_REGION is the cluster's region. Wrong values
+  # cause the agent's AWS tool calls to fail.
+  CLUSTER_NAME: "ai-platform"
+  AWS_REGION: "us-east-1"
+
+  # Which namespaces to watch. "*" = all except those in EXCLUDE_NAMESPACES.
+  # NOTE: ai-platform is NOT excluded — we watch the platform services there
+  # (litellm, langfuse, …). The watcher skips only its OWN pods/Jobs, by label
+  # + name, not by excluding the whole namespace (see event_watcher.py).
+  WATCH_NAMESPACES: "*"
+  EXCLUDE_NAMESPACES: "kube-system,kube-node-lease,kube-public,argocd,external-secrets,gpu-operator,amazon-cloudwatch"
+
+  # Per-resource debounce (no re-investigation within this window).
+  DEBOUNCE_WINDOW_SEC: "600"
+
+  # After a resource is concluded out-of-scope (can't auto-remediate), don't
+  # re-investigate it for this long. Stops stuck platform resources (e.g. an
+  # AITeam in ai-platform) from re-firing every debounce window and draining
+  # the daily budget. 86400 = re-check once a day.
+  OUT_OF_SCOPE_COOLDOWN_SEC: "86400"
+
+  # Trigger toggles. "false" disables that signal.
+  TRIGGER_CRASHLOOP: "true"
+  TRIGGER_OOMKILLED: "true"
+  TRIGGER_IMAGEPULL: "true"
+  TRIGGER_FAILEDSCHED: "true"
+  TRIGGER_NODENOTREADY: "true"
+  TRIGGER_FAILEDMOUNT: "true"
+  TRIGGER_STUCKRESOURCE: "true"
+  # Missing Secret/ConfigMap referenced as env (envFrom/valueFrom) →
+  # CreateContainerConfigError. Distinct from FailedMount (volume mounts).
+  TRIGGER_CONFIGERROR: "true"
+  # Container can't start (bad command, missing binary, perms) → RunContainerError.
+  TRIGGER_RUNCONTAINERERROR: "true"
+  # Node MemoryPressure/DiskPressure/PIDPressure=True or cordoned (unschedulable).
+  TRIGGER_NODEPRESSURE: "true"
+  # Pod sandbox / CNI setup failure → pod stuck ContainerCreating.
+  TRIGGER_PODSANDBOX: "true"
+  # Pod Running but persistently not Ready (readiness probe failing). Gated by
+  # POD_NOT_READY_THRESHOLD_SEC to clear normal slow model loads.
+  TRIGGER_PODNOTREADY: "true"
+
+  # Stuck-resource scanner — polls the KRO serving/team CRs (VLLMEndpoint,
+  # LLMDEndpoint, LLMDDisaggEndpoint, AITeam). Fires when any has been in a
+  # non-healthy state for this long.
+  STUCK_RESOURCE_THRESHOLD_SEC: "300"
+  STUCK_RESOURCE_POLL_INTERVAL: "60"
+
+  # A Running pod still not Ready after this long is treated as stuck (readiness
+  # probe failing). High enough to clear normal startup / vLLM model loads.
+  POD_NOT_READY_THRESHOLD_SEC: "600"
+
+  # Concurrency + cost guards.
+  MAX_CONCURRENT_INVESTIGATIONS: "3"
+  MAX_INVESTIGATIONS_PER_DAY: "50"
+  MAX_REMEDIATIONS_PER_DAY: "20"
+
+  # Approval timeout — investigations older than this can't be approved
+  # (enforced by cluster-dashboard's approve handler).
+  APPROVAL_EXPIRY_HOURS: "24"
+
+  # Models. Available list: kiro-cli chat --list-models
+  # Both on "auto" — kiro-cli routes per-step for speed/cost. Investigate is
+  # read-only; remediate executes approved writes but the RBAC boundary
+  # (inference + team-* only) is the real safety control, not the model. Pin a
+  # specific model here (e.g. claude-opus-4.8) if you want deterministic
+  # remediation reasoning at higher latency/cost.
+  KIRO_MODEL_INVESTIGATE: "auto"
+  KIRO_MODEL_REMEDIATE: "auto"
+
+  # Database (no password — that's in platform-db-credentials secret in ai-platform).
+  DB_HOST: "platform-db.ai-platform.svc.cluster.local"
+  DB_PORT: "5432"
+  DB_NAME: "platform_health_agent"
+
+  # Image pinning. Bumping these forces all components to redeploy.
+  KIRO_CLI_VERSION: "latest"          # kiro.dev installer fetches latest by default
+  KUBECTL_VERSION: "v1.32.5"          # match cluster minor version
+  PYTHON_IMAGE: "python:3.12-slim"

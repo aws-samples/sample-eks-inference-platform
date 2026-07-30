@@ -1,0 +1,73 @@
+# AppProjects — the ENFORCED trust boundary for GitOps.
+#
+# `ai-platform-workloads` is the project every self-service workload Application
+# runs under. It turns the git-write boundary (teams get write access to the
+# workloads repo ONLY — see workloads.yaml / values.yaml) into an ENFORCED
+# boundary rather than a documented convention: even with write access to the
+# workloads repo, a commit can only
+#   - create the four KRO endpoint/team kinds (VLLMEndpoint, LLMDEndpoint,
+#     LLMDDisaggEndpoint, AITeam),
+#   - in the platform serving namespaces (ai-platform, inference, team-*),
+#   - and NO cluster-scoped resources at all.
+# A malicious or mistaken commit of a ClusterRoleBinding, a privileged
+# DaemonSet, a raw Pod, or a Secret in kube-system is REFUSED by ArgoCD, not
+# applied. (Before this, both workloads ApplicationSets ran under the built-in
+# `default` project, which permits any kind in any namespace — so repo write was
+# effectively cluster-admin via ArgoCD.)
+#
+# The platform ApplicationSet deliberately stays on the built-in `default`
+# project: those manifests live in the platform repo (maintainer-controlled,
+# same trust boundary as the cluster itself) and legitimately span many kinds
+# and namespaces.
+#
+# The repo URL is injected ONCE by Terraform via Helm values — same source as
+# the ApplicationSets (.Values.workloadsRepoURL, defaulting to .Values.repoURL).
+{{- $wr := .Values.workloadsRepoURL | default .Values.repoURL }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: ai-platform-workloads
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: ai-platform
+spec:
+  description: >-
+    Self-service workloads (models, scale-models, teams). Restricted to KRO
+    endpoint/team CRs in the platform serving namespaces; no cluster-scoped
+    resources permitted.
+  # Applications in this project live in the argocd control-plane namespace.
+  # The ArgoCD controller runs in a separate EKS-managed namespace, so the
+  # permitted app namespace must be explicit here (the built-in `default`
+  # project sets the same). Without it, ArgoCD refuses the Application with
+  # "not permitted to use project 'ai-platform-workloads'".
+  sourceNamespaces:
+    - argocd
+  # Only the workloads repo may be a source for Applications in this project.
+  sourceRepos:
+    - {{ $wr | quote }}
+  # Only the platform serving namespaces on the in-cluster destination. A
+  # workloads directory named anything other than `inference` or `team-<name>`
+  # (the convention in workloads.yaml) targets a namespace outside this list and
+  # is refused — the naming convention becomes enforced, not just documented.
+  destinations:
+    - name: local-cluster
+      namespace: ai-platform
+    - name: local-cluster
+      namespace: inference
+    - name: local-cluster
+      namespace: team-*
+  # Deny ALL cluster-scoped resources: an empty whitelist permits nothing.
+  clusterResourceWhitelist: []
+  # Permit ONLY the KRO endpoint/team kinds. Every other namespaced kind
+  # (Deployment, Secret, Role/RoleBinding, ServiceAccount, raw Pod, …) is
+  # refused, so a workloads commit cannot escalate privilege or read secrets.
+  namespaceResourceWhitelist:
+    - group: kro.run
+      kind: VLLMEndpoint
+    - group: kro.run
+      kind: LLMDEndpoint
+    - group: kro.run
+      kind: LLMDDisaggEndpoint
+    - group: kro.run
+      kind: AITeam

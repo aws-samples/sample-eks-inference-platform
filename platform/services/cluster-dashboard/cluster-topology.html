@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Platform — Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#0f1118; --surface:#171a26; --surface-2:#1e2130; --surface-hover:#242838;
+  --border:#272b3d; --border-light:#343a52; --text:#e8eaf0; --text-2:#9aa1b4; --text-muted:#616880;
+  --accent:#6366f1; --accent-soft:rgba(99,102,241,0.14);
+  --green:#34d399; --green-soft:rgba(52,211,153,0.13);
+  --amber:#fbbf24; --amber-soft:rgba(251,191,36,0.13);
+  --red:#f87171; --red-soft:rgba(248,113,113,0.13);
+  --purple:#a78bfa; --purple-soft:rgba(167,139,250,0.14);
+  --cyan:#22d3ee; --cyan-soft:rgba(34,211,238,0.13);
+  --teal:#2dd4bf; --teal-soft:rgba(45,212,191,0.13);
+  --orange:#fb923c; --orange-soft:rgba(251,146,60,0.14);
+  --font:'Manrope',sans-serif; --mono:'JetBrains Mono',monospace; --r:12px; --r-sm:7px;
+}
+/* Light theme — toggled by the topbar button (sets body[data-theme="light"]). */
+body[data-theme="light"]{
+  --bg:#f5f6f8; --surface:#ffffff; --surface-2:#eef1f5; --surface-hover:#e9edf3;
+  --border:#e2e6ee; --border-light:#cfd5e1; --text:#161923; --text-2:#4c5468; --text-muted:#858ca0;
+  --accent:#4f46e5; --accent-soft:rgba(79,70,229,0.12);
+  --green:#059669; --amber:#b45309; --red:#dc2626;
+  --green-soft:rgba(5,150,105,0.12); --amber-soft:rgba(180,83,9,0.14); --red-soft:rgba(220,38,38,0.10);
+  --purple-soft:rgba(124,58,237,0.10); --cyan-soft:rgba(8,145,178,0.12);
+  --teal-soft:rgba(13,148,136,0.12); --orange-soft:rgba(234,88,12,0.12);
+}
+body[data-theme="light"] .nav-item.active{color:var(--accent)}
+/* Clickable health alerts (route to the relevant model/node/view/link). */
+.alert.clickable{cursor:pointer;border-radius:var(--r-sm);transition:background .12s;margin:0 -6px;padding-left:6px;padding-right:6px}
+.alert.clickable:hover{background:var(--surface-hover)}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:var(--font);background:var(--bg);color:var(--text);height:100vh;overflow:hidden;font-size:13px}
+.app{display:grid;grid-template-columns:212px 1fr;grid-template-rows:58px 1fr;height:100vh}
+/* Topbar */
+.top{grid-column:1/-1;display:flex;align-items:center;gap:14px;padding:0 20px;background:var(--surface);border-bottom:1px solid var(--border)}
+.logo{font-size:16px;font-weight:800;letter-spacing:-.3px}.logo span{color:var(--accent)}
+.top-sep{width:1px;height:26px;background:var(--border)}
+.search{flex:1;max-width:420px;display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:7px 11px;color:var(--text-muted);font-size:12px}
+.search input{background:none;border:none;outline:none;color:var(--text);font-family:var(--font);font-size:12px;width:100%}
+.spacer{flex:1}
+.pill{display:flex;align-items:center;gap:8px;background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:6px 11px;font-size:12px}
+.pill b{font-family:var(--mono);font-weight:700}
+.pill .cg{color:var(--green)} .pill.warn{border-color:rgba(251,191,36,.35)}
+.pill.warn .cw{color:var(--amber);font-weight:700}
+.live{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:600;color:var(--green)}
+.live::before{content:'';width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+.icon-btn{background:none;border:1px solid var(--border);border-radius:var(--r-sm);padding:6px 9px;color:var(--text-2);cursor:pointer;font-size:13px}
+.icon-btn:hover{background:var(--surface-hover)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+/* Nav */
+.nav{background:var(--surface);border-right:1px solid var(--border);padding:14px 10px;display:flex;flex-direction:column;gap:3px}
+.nav-item{display:flex;align-items:center;gap:11px;padding:9px 12px;border-radius:var(--r-sm);color:var(--text-2);cursor:pointer;font-weight:600;font-size:13px}
+.nav-item:hover{background:var(--surface-hover);color:var(--text)}
+.nav-item.active{background:var(--accent-soft);color:#c7d2fe}
+.nav-item .ni{font-size:15px;width:18px;text-align:center}
+.nav-item .badge{margin-left:auto;background:var(--red);color:#fff;font-size:10px;font-weight:700;border-radius:9px;padding:1px 6px}
+.nav-foot{margin-top:auto;display:flex;flex-direction:column;gap:2px}
+.nav-link{display:flex;align-items:center;gap:9px;padding:7px 12px;border-radius:var(--r-sm);color:var(--text-muted);text-decoration:none;font-size:12px}
+.nav-link:hover{background:var(--surface-hover);color:var(--text-2)}
+/* Main */
+.main{overflow-y:auto;padding:22px 26px}
+.view{display:none}.view.active{display:block}
+.vhead{display:flex;align-items:baseline;gap:12px;margin-bottom:18px}
+.vtitle{font-size:20px;font-weight:800;letter-spacing:-.4px}
+.vsub{font-size:12px;color:var(--text-muted)}
+.sec-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text-muted);margin:24px 0 12px}
+.sec-title:first-child{margin-top:0}
+/* KPI cards */
+.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:14px 15px;position:relative;overflow:hidden}
+.kpi-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:var(--text-muted)}
+.kpi-val{font-size:26px;font-weight:800;margin-top:6px;font-family:var(--mono);line-height:1}
+.kpi-sub{font-size:11px;color:var(--text-2);margin-top:6px}
+.kpi-sub .up{color:var(--green)}.kpi-sub .down{color:var(--red)}
+.kpi .spark{position:absolute;right:8px;bottom:6px;opacity:.5}
+.kpi.good .kpi-val{color:var(--green)} .kpi.warn .kpi-val{color:var(--amber)}
+/* Grid layouts */
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.cols-3{display:grid;grid-template-columns:1.6fr 1fr;gap:16px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:16px}
+.card-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.card-h h3{font-size:13px;font-weight:700}
+.card-h a{font-size:11px;color:var(--accent);text-decoration:none}
+/* Table */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{text-align:left;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);padding:0 10px 9px;border-bottom:1px solid var(--border)}
+th.num,td.num{text-align:right;font-family:var(--mono)}
+td{padding:11px 10px;border-bottom:1px solid var(--border)}
+tr:last-child td{border-bottom:none}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--surface-2)}
+.m-name{font-weight:700}
+.m-id{font-size:11px;color:var(--text-muted);font-family:var(--mono)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle}
+.dot.ok{background:var(--green);box-shadow:0 0 6px rgba(52,211,153,.5)}
+.dot.warn{background:var(--amber);animation:pulse 1.5s infinite}
+.dot.bad{background:var(--red)}
+/* Badges */
+.badge2{font-size:9.5px;font-weight:700;text-transform:uppercase;letter-spacing:.4px;padding:3px 7px;border-radius:5px;white-space:nowrap}
+.b-bedrock{background:var(--orange-soft);color:var(--orange)}
+.b-vllm{background:var(--green-soft);color:var(--green)}
+.b-llmd{background:var(--purple-soft);color:var(--purple)}
+.b-disagg{background:var(--purple-soft);color:var(--purple);box-shadow:inset 0 0 0 1px var(--purple)}
+.dep-warn{margin:8px 0;padding:10px 12px;border-radius:8px;background:var(--orange-soft);color:var(--orange);font-size:13px}
+.dep-warn ul{margin:6px 0 0;padding-left:18px}
+.dep-warn li{margin:2px 0}
+.sub-title{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin:14px 0 6px}
+.scale-pool{margin:9px 0;padding:10px 12px;background:var(--bg);border:1px solid var(--border);border-radius:8px}
+.scale-hd{font-size:13px;margin-bottom:7px}
+.scale-hd .cnt{float:right;color:var(--text-2);font-family:var(--mono);font-size:12px}
+.scale-bar{height:7px;background:var(--border);border-radius:4px;overflow:hidden}
+.scale-fill{height:100%;border-radius:4px;transition:width .3s}
+.scale-sig{font-size:12px;margin-top:7px;color:var(--text-2)}
+.scale-sig b{font-family:var(--mono)}
+.scale-ev{margin-top:8px}
+.scale-ev .ev{margin:2px 0;font-size:11.5px;color:var(--text-2)}
+.stag{display:inline-block;font-size:10px;font-weight:700;padding:1px 7px;border-radius:8px;margin-left:6px;text-transform:uppercase;letter-spacing:.5px}
+.stag.crit{background:var(--red);color:#fff}
+.stag.warn{background:var(--amber);color:#111}
+.stag.ok{background:rgba(52,211,153,.18);color:var(--green)}
+.ev-list{display:flex;flex-direction:column;gap:4px}
+.ev{font-size:13px;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.03)}
+.ev.warn{background:var(--orange-soft)}
+.ev-r{font-weight:700;color:var(--text)}
+.ev-m{color:var(--text-muted)}
+.logtail{max-height:180px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.45}
+.b-ft{background:var(--cyan-soft);color:var(--cyan)}
+.b-ray{background:rgba(255,255,255,.06);color:var(--text-muted)}
+.st{font-size:10px;font-weight:700;padding:3px 8px;border-radius:5px}
+.st.ok{background:var(--green-soft);color:var(--green)}
+.st.warn{background:var(--amber-soft);color:var(--amber)}
+.st.bad{background:var(--red-soft);color:var(--red)}
+.act{display:inline-flex;gap:5px}
+.act button{background:var(--surface-2);border:1px solid var(--border);border-radius:5px;color:var(--text-2);cursor:pointer;font-size:11px;padding:4px 7px}
+.act button:hover{border-color:var(--accent);color:var(--text)}
+.muted{color:var(--text-muted)}
+/* progress bars */
+.bar{height:7px;border-radius:4px;background:var(--surface-2);overflow:hidden}
+.bar>i{display:block;height:100%;border-radius:4px}
+.bar-lbl{display:flex;justify-content:space-between;font-size:11px;margin-bottom:5px;font-family:var(--mono)}
+/* filter tabs */
+.tabs{display:flex;gap:6px;margin-bottom:14px}
+.tab{padding:6px 13px;border:1px solid var(--border);border-radius:20px;font-size:12px;font-weight:600;color:var(--text-2);cursor:pointer;background:var(--surface)}
+.tab.active{background:var(--accent-soft);border-color:var(--accent);color:#c7d2fe}
+.tab .cnt{color:var(--text-muted);margin-left:5px}
+/* cost split */
+.stack{display:flex;height:12px;border-radius:6px;overflow:hidden;margin:8px 0}
+.stack>i{height:100%}
+.legend{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--text-2)}
+.legend span{display:flex;align-items:center;gap:6px}.legend i{width:9px;height:9px;border-radius:2px}
+/* health/activity */
+.alert{display:flex;gap:11px;padding:11px 0;border-bottom:1px solid var(--border)}
+.alert:last-child{border-bottom:none}
+.alert .ai{font-size:16px}
+.alert .at{font-weight:600;font-size:12.5px}.alert .ad{font-size:11px;color:var(--text-muted);margin-top:2px}
+.alert .ax{margin-left:auto;display:flex;gap:6px}
+.btn{border-radius:var(--r-sm);padding:5px 11px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);font-family:var(--font)}
+.btn.approve{background:var(--green-soft);color:var(--green);border-color:var(--green)}
+.btn.dismiss{background:var(--surface-2);color:var(--text-2)}
+.feed{font-size:12px;font-family:var(--mono)}
+.feed .fr{display:flex;gap:9px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.03);color:var(--text-2)}
+.feed .ft{color:var(--text-muted)}
+.savings{background:linear-gradient(135deg,var(--green-soft),transparent);border:1px solid rgba(52,211,153,.25);border-radius:var(--r);padding:16px}
+.savings .big{font-size:22px;font-weight:800;color:var(--green);font-family:var(--mono)}
+/* drawer */
+.drawer{position:fixed;top:0;right:-560px;width:540px;max-width:92vw;height:100vh;background:var(--surface);border-left:1px solid var(--border);box-shadow:-20px 0 60px rgba(0,0,0,.5);transition:right .25s;z-index:50;overflow-y:auto;padding:22px 24px}
+.drawer.open{right:0}
+.drawer-x{position:absolute;top:18px;right:20px;background:none;border:none;color:var(--text-2);font-size:22px;cursor:pointer}
+.scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);opacity:0;pointer-events:none;transition:opacity .25s;z-index:49}
+.scrim.open{opacity:1;pointer-events:auto}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:8px 14px;font-size:12.5px;margin:10px 0}
+.kv .k{color:var(--text-muted)}.kv .v{font-family:var(--mono)}
+.code{background:var(--bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:11px 13px;font-family:var(--mono);font-size:11.5px;color:var(--text-2);white-space:pre-wrap;line-height:1.6;margin-top:8px}
+.mini-kpi{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:14px 0}
+.mini-kpi .mk{background:var(--surface-2);border-radius:var(--r-sm);padding:10px 12px}
+.mini-kpi .mkv{font-size:18px;font-weight:800;font-family:var(--mono)}
+.mini-kpi .mkl{font-size:10px;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px;margin-top:3px}
+.gpuslots{display:flex;gap:5px;margin-top:8px}
+.gs{flex:1;height:34px;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;font-family:var(--mono)}
+.gs.used{background:linear-gradient(135deg,#7c3aed,#6366f1);color:#fff}
+.gs.free{background:rgba(167,139,250,.06);border:1px dashed rgba(167,139,250,.25);color:var(--text-muted)}
+.util{font-size:10px;color:var(--text-muted);font-family:var(--mono)}
+.mock-tag{position:fixed;bottom:12px;right:16px;background:var(--amber-soft);color:var(--amber);border:1px solid rgba(251,191,36,.35);font-size:10px;font-weight:700;padding:4px 10px;border-radius:20px;letter-spacing:.5px;z-index:60}
+/* Responsive: collapse the sidebar to a horizontal nav, wrap KPIs, stack columns.
+   Placed at the end so these rules win over the base layout when the query matches
+   (media queries add no specificity — source order decides). */
+@media (max-width:860px){
+  body{overflow:auto}
+  .app{grid-template-columns:1fr;grid-template-rows:auto auto 1fr;height:auto;min-height:100vh}
+  .top{flex-wrap:wrap;height:auto;padding:8px 12px;gap:8px}
+  .search{order:3;flex-basis:100%;max-width:none}
+  .spacer{display:none}
+  .live{display:none}
+  .nav{flex-direction:row;overflow-x:auto;border-right:none;border-bottom:1px solid var(--border);padding:8px;gap:6px}
+  .nav-item{white-space:nowrap;flex:0 0 auto}
+  .nav-foot{display:none}
+  .main{overflow-y:visible;height:auto;padding:16px 14px}
+  .kpis{grid-template-columns:repeat(2,1fr)!important}
+  .cols,.cols-3{grid-template-columns:1fr}
+  .drawer{width:100vw;max-width:100vw}
+}
+@media (max-width:480px){
+  .kpis{grid-template-columns:1fr!important}
+  .mini-kpi{grid-template-columns:repeat(2,1fr)}
+}
+</style>
+<style>
+.search{position:relative}
+.q-res{position:absolute;top:36px;left:0;right:0;background:var(--panel,#12161f);border:1px solid var(--border,#242c3a);border-radius:10px;overflow:hidden;z-index:60;box-shadow:0 14px 34px rgba(0,0,0,.45);display:none}
+.q-res.open{display:block}
+.q-item{display:flex;align-items:center;gap:8px;padding:8px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid var(--border,#242c3a)}
+.q-item:last-child{border-bottom:none}
+.q-item:hover,.q-item.sel{background:var(--accent-soft,#1e2636)}
+.q-type{margin-left:auto;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--text-muted,#8b93a7)}
+.ns-legend{display:flex;flex-wrap:wrap;gap:6px 12px;margin:2px 0 9px;font-size:11px;color:var(--text-muted,#8b93a7)}
+.ns-legend span{display:inline-flex;align-items:center;gap:5px}
+.ns-legend i{width:9px;height:9px;border-radius:2px;display:inline-block}
+.np-row{display:flex;align-items:center;gap:8px;padding:3px 0;font-size:12px}
+.np-dot{width:6px;height:6px;border-radius:50%;flex:none}
+.np-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:ui-monospace,monospace}
+.np-meta{margin-left:auto;color:var(--text-muted,#8b93a7);font-size:11px;flex:none}
+.np-sub{font-size:10.5px;color:var(--text-muted,#8b93a7);margin-top:3px}
+.alert.crit{box-shadow:inset 3px 0 0 var(--red,#f87171)}
+.alert.crit .ai{color:var(--red,#f87171)}
+.sev{font-size:10px;font-weight:700;padding:1px 6px;border-radius:6px;margin-left:6px;letter-spacing:.04em}
+.inv-detail{margin-top:8px;padding-top:8px;border-top:1px solid var(--border,#242c3a)}
+.inv-k{font-size:11px;font-weight:700;color:var(--text-muted,#8b93a7);margin-top:6px}
+.inv-v{font-size:12px;margin-top:2px}
+.inv-cmds{font-family:ui-monospace,monospace;font-size:11px;background:var(--bg,#0b0e14);padding:8px 10px;border-radius:8px;white-space:pre-wrap;margin-top:4px;overflow-x:auto}
+.inv-more{font-size:11px;cursor:pointer;color:var(--accent,#818cf8);display:inline-block;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="top">
+    <div class="logo"><span>AI</span> Platform</div>
+    <div class="top-sep"></div>
+    <div class="search">🔎 <input id="q" autocomplete="off" aria-label="Search models, teams, and nodes" role="combobox" aria-expanded="false" placeholder="Search models, teams, nodes…" oninput="doSearch(this.value)" onkeydown="if(event.key==='Enter'){searchGo();}else if(event.key==='Escape'){this.value='';doSearch('');}" onblur="setTimeout(()=>{const r=document.getElementById('q-res');if(r)r.className='q-res'},150)"><div id="q-res" class="q-res"></div></div>
+    <div class="spacer"></div>
+    <div class="pill" id="top-cost" title="Realtime cluster cost — estimate">💲 —</div>
+    <div class="pill" id="top-health" title="Health — click for details" style="cursor:pointer" onclick="go('health',document.querySelectorAll('.nav-item')[5])"></div>
+    <button class="icon-btn" title="Theme" onclick="toggleTheme()">◐</button>
+    <div class="live" id="live" aria-live="polite" role="status">connecting…</div>
+  </div>
+
+  <div class="nav">
+    <div class="nav-item active" onclick="go('overview',this)"><span class="ni">◈</span> Overview</div>
+    <div class="nav-item" onclick="go('models',this)"><span class="ni">▣</span> Models <span class="cnt muted" id="nav-mcount" style="margin-left:auto;font-size:11px"></span></div>
+    <div class="nav-item" onclick="go('teams',this)"><span class="ni">◐</span> Teams</div>
+    <div class="nav-item" onclick="go('cost',this)"><span class="ni">＄</span> Cost</div>
+    <div class="nav-item" onclick="go('infra',this)"><span class="ni">▤</span> Infrastructure</div>
+    <div class="nav-item" onclick="go('health',this)"><span class="ni">♥</span> Health <span class="badge" id="nav-hbadge"></span></div>
+    <div class="nav-foot" id="nav-links"></div>
+  </div>
+
+  <div class="main">
+    <!-- OVERVIEW -->
+    <div class="view active" id="v-overview">
+      <div class="vhead"><div class="vtitle">Overview</div><div class="vsub" id="ov-sub">updated just now</div></div>
+      <div class="kpis" id="kpis"></div>
+      <div class="cols-3" style="margin-top:22px">
+        <div class="card">
+          <div class="card-h"><h3>Top models by traffic</h3><a onclick="go('models',document.querySelectorAll('.nav-item')[1])">View all →</a></div>
+          <table><thead><tr><th>Model</th><th>Tier</th><th class="num">req/min</th><th class="num">p95</th><th class="num">$/hr</th></tr></thead><tbody id="ov-models"></tbody></table>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:16px">
+          <div class="card">
+            <div class="card-h"><h3>Cost</h3><a onclick="go('cost',document.querySelectorAll('.nav-item')[3])">Breakdown →</a></div>
+            <div style="font-size:24px;font-weight:800;font-family:var(--mono);color:var(--green)"><span id="cost-hr-mini">$0.00</span><span style="font-size:12px;color:var(--text-2)">/hr</span></div>
+            <div class="muted" style="font-size:11px" id="cost-mo-mini">~$0/mo if steady</div>
+            <div class="stack" id="cost-stack"></div>
+            <div class="legend" id="cost-legend"></div>
+          </div>
+          <div class="card">
+            <div class="card-h"><h3>GPU utilization</h3><a onclick="go('infra',document.querySelectorAll('.nav-item')[4])">Nodes →</a></div>
+            <div id="gpu-bars"></div>
+          </div>
+        </div>
+      </div>
+      <div class="cols" style="margin-top:16px">
+        <div class="card">
+          <div class="card-h"><h3>Health &amp; Self-Healing</h3><a onclick="go('health',document.querySelectorAll('.nav-item')[5])">All →</a></div>
+          <div id="ov-health"></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h3>Activity</h3></div>
+          <div class="feed" id="ov-feed"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- MODELS -->
+    <div class="view" id="v-models">
+      <div class="vhead"><div class="vtitle">Models</div><div class="vsub">Every model behind one LiteLLM <code>/v1</code> API · click a row for details</div></div>
+      <div class="tabs" id="model-tabs"></div>
+      <div class="card" style="padding:6px 10px">
+        <table><thead><tr><th>Model</th><th>Tier</th><th>Status</th><th class="num">GPU</th><th class="num">req/min</th><th class="num">p50 / p95</th><th class="num">tok/s</th><th class="num">err</th><th class="num">$/hr</th><th>Actions</th></tr></thead><tbody id="models-body"></tbody></table>
+      </div>
+    </div>
+
+    <!-- TEAMS -->
+    <div class="view" id="v-teams">
+      <div class="vhead"><div class="vtitle">Teams</div><div class="vsub">Per-team namespaces, budgets, rate limits &amp; scoped API keys (AITeam)</div></div>
+      <div class="cols" id="teams-grid"></div>
+    </div>
+
+    <!-- COST -->
+    <div class="view" id="v-cost">
+      <div class="vhead"><div class="vtitle">Cost</div><div class="vsub" id="cost-sub">on-demand estimate · spot ≈0.35× · GPU is the driver</div></div>
+      <div class="kpis" id="cost-kpis" style="grid-template-columns:repeat(4,1fr)"></div>
+      <div class="cols-3" style="margin-top:20px">
+        <div class="card"><div class="card-h"><h3>Cost by model</h3></div><div id="cost-by-model"></div></div>
+        <div style="display:flex;flex-direction:column;gap:16px">
+          <div class="card"><div class="card-h"><h3>By team</h3></div><div id="cost-by-team"></div></div>
+          <div class="card"><div class="card-h"><h3>Spend trend</h3></div><div id="cost-trend"></div></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px"><div class="card-h"><h3>Cost &amp; usage by user (last 30d)</h3></div><div id="cost-by-user"></div></div>
+    </div>
+
+    <!-- INFRASTRUCTURE -->
+    <div class="view" id="v-infra">
+      <div class="vhead"><div class="vtitle">Infrastructure</div><div class="vsub">Karpenter GPU pools scale to zero · real GPU utilization (DCGM)</div></div>
+      <div id="infra-pools"></div>
+    </div>
+
+    <!-- HEALTH -->
+    <div class="view" id="v-health">
+      <div class="vhead"><div class="vtitle">Health &amp; Self-Healing</div><div class="vsub">Degradations, GitOps sync &amp; Platform Health Agent approvals</div></div>
+      <div class="cols-3">
+        <div class="card"><div class="card-h"><h3>Alerts &amp; investigations</h3></div><div id="health-alerts"></div></div>
+        <div class="card"><div class="card-h"><h3>ArgoCD sync</h3></div><div id="argo-sync"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Model detail drawer -->
+<div class="scrim" id="scrim" onclick="closeDrawer()"></div>
+<div class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="Detail panel" tabindex="-1"></div>
+
+
+<script>
+const TIERS={bedrock:['Bedrock','b-bedrock'],vllm:['vLLM','b-vllm'],'llm-d':['llm-d','b-llmd'],'llm-d-disagg':['llm-d P/D','b-disagg'],ft:['fine-tuned','b-ft']};
+const MTABS=[['all','All'],['bedrock','Bedrock'],['vllm','vLLM'],['llm-d','llm-d'],['llm-d-disagg','llm-d P/D'],['ft','Fine-tuned']];
+let D={models:[],teams:[],gpu:[],argocd:[],nodes:[],pods:[],cost:{},costExt:{},sources:{},links:[]};
+let mtab='all', selected=null, selectedNode=null, selectedTeam=null, curV='overview', prevM={}, prevN=null, prevS={}, activity=[], invs=[], lastSearch=[];
+const NAVIX={overview:0,models:1,teams:2,cost:3,infra:4,health:5};
+let routed=false;
+const NS_COLORS=['#818cf8','#34d399','#fbbf24','#f472b6','#22d3ee','#a78bfa','#fb923c','#4ade80','#e879f9','#60a5fa','#f87171','#2dd4bf'];
+function nsColor(ns){let h=0;for(let i=0;i<(ns||'').length;i++)h=(h*31+ns.charCodeAt(i))>>>0;return NS_COLORS[h%NS_COLORS.length];}
+function relTime(iso){if(!iso)return'';const d=(Date.now()-new Date(iso).getTime())/1000;if(d<3600)return Math.max(1,Math.round(d/60))+'m';if(d<86400)return Math.round(d/3600)+'h';return Math.round(d/86400)+'d';}
+const hist={rpm:[],tok:[],cost:[],gpu:[]};
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const num=n=>(n==null||n==='—')?'—':(typeof n==='number'?(n>=1000?(n/1000).toFixed(n>=10000?0:1)+'k':(Number.isInteger(n)?n:n.toFixed(1))):n);
+const ms=v=>v==null?'—':v+'ms';
+const tierLabel=t=>(TIERS[t]||['?'])[0];
+const tierBadge=t=>{const x=TIERS[t]||['?','b-ray'];return `<span class="badge2 ${x[1]}">${x[0]}</span>`};
+const modeCls=t=>t==='ft'?'b-ft':(TIERS[t]||['','b-ray'])[1];
+const spark=(pts,c='var(--accent)',w=54,h=18)=>{const p=(pts||[]).filter(x=>x!=null);if(p.length<2)return '';const mx=Math.max(...p),mn=Math.min(...p);const pk=p.map((v,i)=>`${(i/(p.length-1))*w},${(h-((v-mn)/((mx-mn)||1))*h).toFixed(1)}`).join(' ');return `<svg class="spark" width="${w}" height="${h}"><polyline points="${pk}" fill="none" stroke="${c}" stroke-width="1.5"/></svg>`};
+const push=(a,v,n=32)=>{a.push(v);while(a.length>n)a.shift();};
+
+async function poll(){
+  try{
+    const r=await fetch('/data.json');if(!r.ok)throw 0;D=await r.json();
+    diffActivity();pushHist();
+    try{const ri=await fetch('/investigations');if(ri.ok)invs=(await ri.json()).items||[];}catch(e){}
+    renderAll();$('live').textContent='Live';if(!routed){routed=true;routeFromHash();}
+  }catch(e){$('live').textContent='reconnecting…';}
+}
+function pushHist(){const m=D.models||[];push(hist.rpm,m.reduce((s,x)=>s+(x.rpm||0),0));push(hist.tok,Math.round(m.reduce((s,x)=>s+(x.tps||0),0)*60));push(hist.cost,(D.cost||{}).hourly||0);const g=(D.gpu||[]).flatMap(x=>x.util||[]);push(hist.gpu,g.length?Math.round(g.reduce((a,b)=>a+b,0)/g.length):0);}
+function diffActivity(){const t=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'});const cur={};(D.models||[]).forEach(m=>cur[m.name]=m.status);for(const n in cur){if(!(n in prevM))activity.unshift([t,`Model "${n}" appeared → ${cur[n]}`]);else if(prevM[n]!==cur[n])activity.unshift([t,`Model "${n}" → ${cur[n]}`]);}for(const n in prevM){if(!(n in cur))activity.unshift([t,`Model "${n}" removed`]);}prevM=cur;const curN={};(D.nodes||[]).forEach(nd=>curN[nd.name]=nd.instance||'node');if(prevN!==null){for(const nm in curN){if(!(nm in prevN))activity.unshift([t,`Node ${nm.split('.')[0]} (${curN[nm]}) joined`]);}for(const nm in prevN){if(!(nm in curN))activity.unshift([t,`Node ${nm.split('.')[0]} removed`]);}}prevN=curN;const curS={};(D.autoscaling||[]).forEach(a=>{const k=a.pool+(a.role?' ('+a.role+')':'');curS[k]=a.current;});for(const k in curS){if(k in prevS&&prevS[k]!==curS[k])activity.unshift([t,`⇅ ${k} scaled ${prevS[k]} → ${curS[k]} replicas`]);}prevS=curS;while(activity.length>18)activity.pop();if(!activity.length)activity=[[t,'Connected to cluster']];}
+
+function alertList(){const out=[];(D.models||[]).forEach(m=>{if(m.status!=='running'){const d=m.deploy||{};let reason='';if(m.reconcileError)reason=m.reconcileError;else if(d.provisioning&&d.provisioning.length)reason='waiting for GPU node — '+d.provisioning[0].reason;else if(d.waiting&&d.waiting.reason)reason=d.waiting.reason;else if(d.events&&d.events.length){const w=d.events.find(e=>e.type==='Warning')||d.events[0];reason=w.reason;}const sev=(m.status==='error'||(d.provisioning&&d.provisioning.length))?'crit':'warn';out.push({icon:m.status==='error'?'✗':'⚠',sev,t:`${m.name} · ${m.status}`,d:reason?`${tierLabel(m.tier)} · ${reason}`:`${tierLabel(m.tier)} · ${m.availableReplicas||0}/${m.replicas||1} replicas ready`,open:['model',m.name]});}else if((m.tier==='llm-d'||m.tier==='llm-d-disagg')&&m.router&&m.router!=='Healthy')out.push({icon:'⚠',sev:'warn',t:`${m.name} · router ${m.router}`,d:'llm-d EPP/router not yet Healthy',open:['model',m.name]});else if(m.health&&m.health.toLowerCase()!=='healthy')out.push({icon:'⚠',sev:'warn',t:`${m.name} · ${m.health}`,d:'LiteLLM health check',open:['model',m.name]});});(D.provisioning||[]).slice(0,1).forEach(e=>out.push({icon:'☁',sev:'crit',t:`GPU capacity · ${e.reason}`,d:e.message,open:['view','infra']}));(D.argocd||[]).forEach(a=>{if(a.sync!=='Synced'||a.health!=='Healthy')out.push({icon:'🚢',sev:(a.health==='Degraded'||a.health==='Missing')?'crit':'warn',t:`ArgoCD · ${a.name}`,d:`${a.sync} · ${a.health}`,open:['link','argocd']});});(D.nodeAlerts||[]).forEach(a=>out.push({icon:'🖥',sev:(a.issue==='NotReady'?'crit':'warn'),t:`Node ${a.node} · ${a.issue}`,d:'EKS node condition',open:['node',a.node]}));return out;}
+
+function renderAll(){ovSub();kpis();topbar();ovModels();costMini();gpuBars();ovHealth();ovFeed();modelTabs();modelsBody();teamsView();costViews();infra();healthView();links();if(selected)openModel(selected,true);if(selectedNode)openNode(selectedNode,true);if(selectedTeam)openTeam(selectedTeam,true);}
+
+function ovSub(){const s=$('ov-sub');if(!s)return;const age=D.ts?Math.max(0,Math.round(Date.now()/1000-D.ts)):null;const when=age===null?'updated just now':(age<5?'updated just now':'updated '+age+'s ago');const parts=[D.cluster,D.region].filter(Boolean);parts.push(when);s.textContent=parts.join(' · ');}
+
+function topbar(){const c=D.cost||{};$('top-cost').innerHTML=`💲 <b class="cg">$${(c.hourly||0).toFixed(2)}</b>/hr · ~$${Math.round(c.monthly||0).toLocaleString()}/mo`;const al=alertList().length,ap=D.approvals_pending||0;const p=$('top-health');p.className='pill'+(al||ap?' warn':'');p.innerHTML=(al||ap)?`<span class="cw">⚠ ${al}</span> alerts · <b>${ap}</b> approval${ap===1?'':'s'}`:`✓ healthy`;const nm=$('nav-mcount');if(nm)nm.textContent=(D.models||[]).length||'';const hb=$('nav-hbadge');if(hb){const n=al+ap;hb.textContent=n||'';hb.style.display=n?'':'none';}}
+
+function kpis(){const m=D.models||[],c=D.cost||{},s=D.sources||{};const live=m.filter(x=>x.status==='running').length,dep=m.length-live;const al=alertList().length,ap=D.approvals_pending||0;
+  const cards=[
+   {l:'Models',v:m.length,s:`${live} live${dep?` · ${dep} deploying`:''}`,c:'var(--accent)'},
+   {l:'Requests',v:s.litellm?num(hist.rpm.at(-1)||0):'—',s:s.litellm?'/min':'metrics unavailable',sp:s.litellm?hist.rpm:null,c:'var(--green)'},
+   {l:'Tokens',v:s.litellm?num(hist.tok.at(-1)||0):'—',s:s.litellm?'/min':'',sp:s.litellm?hist.tok:null,c:'var(--cyan)'},
+   {l:'Cost',v:'$'+(c.hourly||0).toFixed(2),s:`/hr · ~$${Math.round(c.monthly||0).toLocaleString()}/mo`,sp:hist.cost,c:'var(--green)',cls:'good'},
+   {l:'GPU util',v:s.dcgm&&(D.gpu||[]).length?(hist.gpu.at(-1)||0)+'%':'—',s:s.dcgm&&(D.gpu||[]).length?`${(D.gpu||[]).length} GPU node(s)`:'no GPU nodes',sp:s.dcgm?hist.gpu:null,c:'var(--purple)'},
+   {l:'Health',v:al,s:ap?`<span class="down">${ap} fix ready</span>`:(al?'needs attention':'all clear'),c:'var(--amber)',cls:al?'warn':''},
+  ];
+  $('kpis').innerHTML=cards.map(k=>`<div class="kpi ${k.cls||''}"><div class="kpi-label">${k.l}</div><div class="kpi-val">${k.v}</div><div class="kpi-sub">${k.s}</div>${k.sp?spark(k.sp,k.c):''}</div>`).join('');}
+
+function ovModels(){const rows=(D.models||[]).slice(0,6);$('ov-models').innerHTML=rows.length?rows.map(m=>`<tr onclick="openModel('${esc(m.name)}')"><td><span class="dot ${m.status==='running'?'ok':m.status==='error'?'bad':'warn'}"></span><span class="m-name">${esc(m.name)}</span></td><td>${tierBadge(m.tier)}</td><td class="num">${num(m.rpm)}</td><td class="num">${ms(m.p95)}</td><td class="num">$${(m.costHr||0).toFixed(2)}</td></tr>`).join(''):'<tr><td colspan=5 class="muted" style="padding:16px">No models deployed</td></tr>';}
+
+function costMini(){const c=D.cost||{},bd=(D.models||[]).filter(m=>m.tier==='bedrock').reduce((s,m)=>s+(m.costHr||0),0);const segs=[['GPU',c.gpuHourly||0,'var(--purple)'],['Bedrock',bd,'var(--orange)'],['platform',c.platformHourly||0,'var(--accent)']].filter(x=>x[1]>0);const tot=segs.reduce((s,x)=>s+x[1],0)||1;$('cost-hr-mini').textContent='$'+(c.hourly||0).toFixed(2);$('cost-mo-mini').textContent='~$'+((c.monthly||0)).toLocaleString(undefined,{maximumFractionDigits:0})+'/mo if steady';$('cost-stack').innerHTML=segs.map(x=>`<i style="width:${x[1]/tot*100}%;background:${x[2]}"></i>`).join('');$('cost-legend').innerHTML=segs.map(x=>`<span><i style="background:${x[2]}"></i>${x[0]} $${x[1].toFixed(2)}</span>`).join('');}
+
+function gpuBars(){const g=D.gpu||[];if(!(D.sources||{}).dcgm){$('gpu-bars').innerHTML='<div class="muted" style="font-size:12px">GPU metrics unavailable (dcgm-exporter unreachable)</div>';return;}if(!g.length){$('gpu-bars').innerHTML='<div class="muted" style="font-size:12px">No GPU nodes — scales from zero on demand</div>';return;}$('gpu-bars').innerHTML=g.map(n=>{const u=n.util&&n.util.length?Math.round(n.util.reduce((a,b)=>a+b,0)/n.util.length):0;const mmA=(n.mem||[]).filter(x=>x!=null);const mm=mmA.length?Math.round(mmA.reduce((s,x)=>s+x,0)/mmA.length):null;const c=u===0?'var(--text-muted)':u>85?'var(--amber)':'var(--green)';const lbl=n.model?('· '+esc(n.model)):'<span class="muted">idle</span>';return `<div style="margin-bottom:9px"><div class="bar-lbl"><span>${esc(n.instance)} ${lbl}</span><span>${u}% util${mm!=null?' · '+mm+'% mem':''}</span></div><div class="bar"><i style="width:${u||2}%;background:${c}"></i></div></div>`}).join('');}
+
+function alertAction(o){if(!o)return'';if(o[0]==='model')return `openModel('${o[1]}')`;if(o[0]==='node')return `openNode('${o[1]}')`;if(o[0]==='link')return `openLink('${o[1]}')`;if(o[0]==='view')return `go('${o[1]}')`;return'';}
+function alertRow(a){const act=alertAction(a.open);return `<div class="alert${a.sev==='crit'?' crit':''}${act?' clickable':''}"${act?` onclick="${act}" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click();}"`:''}><span class="ai">${a.icon}</span><div><div class="at">${esc(a.t)}</div><div class="ad">${esc(a.d)}</div></div></div>`}
+function ovHealth(){const al=alertList();$('ov-health').innerHTML=al.length?al.slice(0,4).map(alertRow).join(''):'<div class="muted" style="font-size:12px;padding:8px 0">✓ All models and apps healthy</div>';}
+function ovFeed(){$('ov-feed').innerHTML=activity.map(f=>`<div class="fr"><span class="ft">${f[0]}</span><span>${esc(f[1])}</span></div>`).join('');}
+
+function modelTabs(){const m=D.models||[];$('model-tabs').innerHTML=MTABS.map(t=>{const n=t[0]==='all'?m.length:m.filter(x=>x.tier===t[0]).length;return `<div class="tab ${t[0]===mtab?'active':''}" onclick="mtab='${t[0]}';modelTabs();modelsBody()">${t[1]}<span class="cnt">${n}</span></div>`}).join('');}
+function modelsBody(){const rows=(D.models||[]).filter(m=>mtab==='all'||m.tier===mtab);const mu=(D.sources||{}).litellm;$('models-body').innerHTML=rows.length?rows.map(m=>`<tr onclick="openModel('${esc(m.name)}')"><td><div class="m-name">${esc(m.name)}</div><div class="m-id">${esc(m.model)}</div></td><td>${tierBadge(m.tier)}</td><td>${m.status==='running'?'<span class="st ok">running</span>':m.status==='error'?'<span class="st bad">error</span>':'<span class="st warn">deploying</span>'}${scaleBadge(m)}</td><td class="num">${esc(m.gpu)}</td><td class="num">${mu?num(m.rpm):'—'}</td><td class="num">${mu?(m.p50==null?'—':m.p50+' / '+m.p95+'ms'):'—'}</td><td class="num">${mu?num(m.tps):'—'}</td><td class="num">${mu&&m.errPct!=null?m.errPct+'%':'—'}</td><td class="num">$${(m.costHr||0).toFixed(2)}</td><td><div class="act"><button title="Copy a ready-to-run curl for this model" onclick="event.stopPropagation();copyCurl('${esc(m.name)}',event)">⧉ curl</button><button title="Langfuse" onclick="event.stopPropagation();openLink('langfuse')">📊</button><button title="WebUI" onclick="event.stopPropagation();openLink('webui')">💬</button></div></td></tr>`).join(''):'<tr><td colspan=10 class="muted" style="padding:20px">No models in this tier</td></tr>';}
+
+function teamsView(){const t=D.teams||[];if(!(D.sources||{}).litellm){$('teams-grid').innerHTML='<div class="muted">Team metrics unavailable (LiteLLM DB unreachable)</div>';return;}$('teams-grid').innerHTML=t.length?t.map(x=>{const pct=x.limit?Math.min(100,Math.round(x.budget/x.limit*100)):0;const c=pct>80?'var(--amber)':'var(--green)';const bl=x.limit?`$${x.budget.toFixed(2)} / $${x.limit.toFixed(0)} · ${pct}%`:`$${x.budget.toFixed(2)} · no cap`;return `<div class="card" style="cursor:pointer" onclick="openTeam('${esc(x.name)}')"><div class="card-h"><h3>${esc(x.name)}</h3><span class="m-id">${x.failed?x.failed+' failed today':''}</span></div><div class="bar-lbl"><span>budget</span><span>${bl}</span></div><div class="bar"><i style="width:${x.limit?pct:4}%;background:${c}"></i></div><div class="mini-kpi"><div class="mk"><div class="mkv">${num(x.reqsToday)}</div><div class="mkl">req today</div></div><div class="mk"><div class="mkv">$${(x.spendToday||0).toFixed(2)}</div><div class="mkl">spend today</div></div><div class="mk"><div class="mkv">${x.keys||0}</div><div class="mkl">API keys</div></div></div></div>`}).join(''):'<div class="muted">No teams onboarded yet (create an AITeam)</div>';}
+
+function costViews(){const c=D.cost||{},ce=D.costExt||{};const src=c.priceSource==='aws-price-list'?'live AWS pricing':'on-demand estimate';const cs=$('cost-sub');if(cs)cs.textContent=(c.region?c.region+' ':'')+src+' · spot ≈0.35× · GPU is the driver'+(c.unpriced?' · '+c.unpriced+' node(s) unpriced':'');$('cost-kpis').innerHTML=[
+  {l:'Now',v:'$'+(c.hourly||0).toFixed(2)+'<span style="font-size:12px">/hr</span>',s:`GPU $${(c.gpuHourly||0).toFixed(2)} · platform $${(c.platformHourly||0).toFixed(2)}`,cls:'good'},
+  {l:'Monthly (24×7)',v:'$'+Math.round(c.monthly||0).toLocaleString(),s:'projected'},
+  {l:'Bedrock (tokens)',v:'$'+((D.models||[]).filter(m=>m.tier==='bedrock').reduce((s,m)=>s+(m.costHr||0),0)).toFixed(2)+'<span style="font-size:12px">/hr</span>',s:'pay-per-token, no GPU'},
+  {l:'Spend today',v:'$'+((ce.byTeam||[]).reduce((s,x)=>s+x[1],0)).toFixed(2),s:'across teams (LiteLLM)'},
+ ].map(k=>`<div class="kpi ${k.cls||''}"><div class="kpi-label">${k.l}</div><div class="kpi-val">${k.v}</div><div class="kpi-sub">${k.s}</div></div>`).join('');
+  const bm=ce.byModel||[];const mx=Math.max(1,...bm.map(x=>x[1]));$('cost-by-model').innerHTML=bm.length?bm.map(x=>`<div style="margin-bottom:10px"><div class="bar-lbl"><span>${tierBadge(x[2])} ${esc(x[0])}</span><span>$${x[1].toFixed(2)}/hr</span></div><div class="bar"><i style="width:${x[1]/mx*100}%;background:var(--purple)"></i></div></div>`).join(''):'<div class="muted">No GPU-backed models running</div>';
+  const bt=ce.byTeam||[];const mt=Math.max(1,...bt.map(x=>x[1]));$('cost-by-team').innerHTML=bt.length?bt.map(x=>`<div style="margin-bottom:10px"><div class="bar-lbl"><span>${esc(x[0])}</span><span>$${x[1].toFixed(2)}</span></div><div class="bar"><i style="width:${x[1]/mt*100}%;background:var(--accent)"></i></div></div>`).join(''):'<div class="muted">No team spend today</div>';
+  const tr=ce.trend||[];$('cost-trend').innerHTML=tr.length>1?spark(tr.map(x=>x[1]),'var(--green)',360,60)+`<div class="muted" style="font-size:11px;margin-top:6px">last ${tr.length} days · spend/day</div>`:'<div class="muted">trend builds as usage accrues</div>';
+  const bu=ce.byUser||[];const cbu=$('cost-by-user');
+  if(cbu){
+    if(!bu.length){cbu.innerHTML='<div class="muted">No per-user usage yet — interactive Open WebUI users appear here</div>';}
+    else{
+      const pal=['#7c6cff','#22c55e','#f59e0b','#ef4444','#06b6d4','#a855f7','#84cc16','#ec4899'];
+      const allM=[...new Set(bu.flatMap(u=>(u.models||[]).map(m=>m.model)))];
+      const mc={};allM.forEach((m,i)=>mc[m]=pal[i%pal.length]);
+      const mu=Math.max(1,...bu.map(x=>x.spend||0));
+      const legend=allM.length?'<div class="muted" style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;font-size:11px">'+allM.map(m=>`<span style="display:flex;align-items:center;gap:5px"><i style="width:10px;height:10px;border-radius:2px;background:${mc[m]};display:inline-block"></i>${esc(m)}</span>`).join('')+'</div>':'';
+      cbu.innerHTML=legend+bu.map(u=>{const segs=(u.models||[]).map(m=>`<i style="width:${(m.spend||0)/mu*100}%;background:${mc[m.model]}" title="${esc(m.model)}: $${(m.spend||0).toFixed(4)}"></i>`).join('');return `<div style="margin-bottom:10px"><div class="bar-lbl"><span>${esc(u.user)}</span><span>$${(u.spend||0).toFixed(4)} · ${(u.requests||0).toLocaleString()} req · ${(u.tokens||0).toLocaleString()} tok</span></div><div class="bar" style="display:flex;gap:1px">${segs}</div></div>`;}).join('');
+    }
+  }
+}
+
+const POOLMAP={'gpu-inference':'GPU · dedicated','gpu-shared':'GPU · time-sliced','default':'platform services','__mng__':'critical addons'};
+function infra(){const nodes=D.nodes||[],pods=D.pods||[],gpu=D.gpu||[];const utilByHost={};gpu.forEach(g=>utilByHost[g.node]=g);const pools={};nodes.forEach(n=>{(pools[n.pool||'__mng__']=pools[n.pool||'__mng__']||[]).push(n)});let h='';for(const p of Object.keys(pools)){const pl=(p==='__mng__')?'Managed node group':('Karpenter NodePool · '+p);const pd=POOLMAP[p]||'';h+=`<div class="sec-title">${esc(pl)}${pd?' · '+esc(pd):''} · ${pools[p].length} node(s)</div><div class="cols">`;h+=pools[p].map(n=>{const host=n.name.split('.')[0];const g=utilByHost[host];const mdl=g&&g.model;const cnp=n.cpuAllocM?Math.round((n.cpuUsedM||0)/n.cpuAllocM*100):null;const mnp=n.memAllocMi?Math.round((n.memUsedMi||0)/n.memAllocMi*100):null;const usg=cnp!=null?` · <span class="muted">cpu ${cnp}% · mem ${mnp}%</span>`:'';const slots=(n.gpu>0)?`<div class="gpuslots">${(g&&g.util||Array(n.gpu).fill(0)).map(u=>u===0&&!mdl?'<div class="gs free">free</div>':`<div class="gs used">${u}%</div>`).join('')}</div>`:'';return `<div class="card" style="cursor:pointer" onclick="openNode('${esc(n.name)}')"><div class="card-h"><h3>${esc(n.instance)} <span class="badge2 b-ray" style="background:var(--accent-soft);color:#c7d2fe">${esc(n.capacity||'')}</span></h3><span class="util">$${(n.hourly||0).toFixed(2)}/hr</span></div>${slots}<div class="util" style="margin-top:8px">${mdl?'serving '+esc(mdl):(n.gpu>0?'idle':esc(n.zone||''))}${usg}</div></div>`}).join('');h+='</div>';}$('infra-pools').innerHTML=h||'<div class="muted">No nodes</div>';}
+
+function fSev(s){s=(s||'').toUpperCase();return {LOW:'#34d399',MEDIUM:'#fbbf24',HIGH:'#fb923c',CRITICAL:'#f87171'}[s]||'#8b93a7';}
+function invCard(iv){const f=iv.findings;const isObj=f&&typeof f==='object';
+  const summary=isObj?(f.summary||''):(f||'');const sev=isObj?(f.severity||''):'';
+  const risk=isObj?(f.risk_assessment||''):'';const cmds=(isObj&&Array.isArray(f.fix_commands))?f.fix_commands:[];
+  const sevB=sev?`<span class="sev" style="background:${fSev(sev)}22;color:${fSev(sev)}">${esc(sev)}</span>`:'';
+  const did='invd-'+iv.id;
+  const detail=`<div id="${did}" class="inv-detail" style="display:none">`
+    +(risk?`<div class="inv-k">Risk assessment</div><div class="inv-v">${esc(risk)}</div>`:'')
+    +`<div class="inv-k">Proposed fix commands</div>`
+    +(cmds.length?`<pre class="inv-cmds">${esc(cmds.join('\n'))}</pre>`:'<div class="inv-v muted">No commands proposed — nothing to apply (informational).</div>')
+    +`</div>`;
+  return `<div class="alert"><span class="ai">🔧</span><div style="flex:1"><div class="at">${esc(iv.resource_kind||'')} ${esc(iv.resource_name||'')} — fix ready ${sevB}</div><div class="ad">${esc(summary.slice(0,240))}</div><a class="inv-more" onclick="var e=document.getElementById('${did}');var o=e.style.display==='none';e.style.display=o?'block':'none';this.textContent=o?'hide details ▾':'details ▸'">details ▸</a>${detail}</div><div class="ax"><button class="btn approve" onclick="approve('${iv.id}',this)">Approve fix</button><button class="btn dismiss" onclick="dismiss('${iv.id}',this)">Dismiss</button></div></div>`;}
+function healthView(){const al=alertList();$('health-alerts').innerHTML=(invs.length?invs.map(invCard).join(''):'')+(al.length?al.map(alertRow).join(''):(invs.length?'':'<div class="muted" style="padding:8px 0">✓ All models and apps healthy · no pending fixes</div>'));
+  const a=D.argocd||[];$('argo-sync').innerHTML=(D.sources||{}).argocd?(a.length?a.map(x=>`<div class="alert"><span class="ai">${x.health==='Healthy'&&x.sync==='Synced'?'🟢':'🟡'}</span><div><div class="at">${esc(x.name)}</div><div class="ad">${esc(x.sync)} · ${esc(x.health)}</div></div></div>`).join(''):'<div class="muted">no applications</div>'):'<div class="muted">ArgoCD status unavailable</div>';}
+// Mutating calls carry X-Requested-With: the backend requires it as CSRF
+// protection and (on the ALB path) oauth2-proxy injects the verified identity
+// token. A non-OK response means auth/CSRF was refused — surface it rather than
+// silently resetting the button (e.g. approvals aren't available on the raw
+// tunnel path, which has no verified identity).
+async function mutate(url){
+  const r=await fetch(url,{method:'POST',headers:{'X-Requested-With':'dashboard'}});
+  if(!r.ok){let m='';try{m=(await r.json()).error||'';}catch(e){}
+    alert('Action refused ('+r.status+'): '+(m||'not authorized'));}
+  return r.ok;}
+async function approve(id,b){b.disabled=true;b.textContent='…';try{await mutate('/investigations/'+id+'/approve');}catch(e){}poll();}
+async function dismiss(id,b){b.disabled=true;try{await mutate('/investigations/'+id+'/dismiss');}catch(e){}poll();}
+
+// Over `platformctl tunnel` you reach the dashboard at localhost:9090 and the
+// other UIs are port-forwarded to localhost too — but the server-built links
+// point at the edge or the internal ALB (neither reachable from your laptop).
+// When we're served from localhost, rewrite the UI links to localhost:<port> so
+// the Quick Links work through the tunnel. Edge / in-VPC (ALB) access is left as
+// the server built it. ArgoCD has its own endpoint and is never rewritten.
+const TUNNEL_URLS={webui:'http://localhost:8080/',litellm:'http://localhost:4000/ui/',langfuse:'http://localhost:3000/'};
+function resolveLinkUrl(x){if(!x||!x.url)return'#';const h=location.hostname;if(h==='localhost'||h==='127.0.0.1'){const lbl=(x.label||'').toLowerCase();if(lbl.includes('webui'))return TUNNEL_URLS.webui;if(lbl.includes('litellm'))return TUNNEL_URLS.litellm;if(lbl.includes('langfuse'))return TUNNEL_URLS.langfuse;}return x.url;}
+function links(){const l=D.links||[];$('nav-links').innerHTML=l.map(x=>`<a class="nav-link" href="${esc(resolveLinkUrl(x))}" target="_blank" rel="noopener" title="${esc(x.desc||'')}">${x.icon||'🔗'} ${esc(x.label)} ↗</a>`).join('');}
+function linkFor(kind){return (D.links||[]).find(l=>l.label.toLowerCase().includes(kind))||{}}
+function openLink(kind){const u=resolveLinkUrl(linkFor(kind));if(u&&u!=='#')window.open(u,'_blank');}
+function copyCurl(name,ev){const u=(linkFor('litellm').url||'$LITELLM').replace(/\/ui.*/,'');const t=`curl ${u}/v1/chat/completions -H "Authorization: Bearer $LITELLM_KEY" -H "Content-Type: application/json" -d '{"model":"${name}","messages":[{"role":"user","content":"Hello"}]}'`;const fb=()=>{try{const b=ev&&ev.target&&ev.target.closest('button');if(b){const o=b.innerHTML;b.innerHTML='✓ copied';setTimeout(()=>{b.innerHTML=o;},1200);}}catch(e){}};if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(fb,fb);}else{fb();}}
+
+function deployHTML(m){
+  const d=m&&m.deploy; const rerr=m&&m.reconcileError;
+  if(!d&&!rerr) return '';
+  let h='<div class="sec-title">Deployment</div>';
+  if(rerr) h+=`<div class="dep-warn"><b>✗ Reconcile error</b> — KRO could not apply this endpoint:<div style="margin-top:5px">${esc(rerr)}</div></div>`;
+  if(!d) return h;
+  const rows=[`<span class="k">Pod phase</span><span class="v">${esc(d.phase||'—')}${d.pod?` · <span class="muted">${esc(d.pod)}</span>`:''}</span>`];
+  if(d.waiting) rows.push(`<span class="k">Container</span><span class="v" style="color:var(--orange)">${esc(d.waiting.reason||'')}${d.waiting.message?` — ${esc(d.waiting.message)}`:''}</span>`);
+  h+=`<div class="kv">${rows.join('')}</div>`;
+  if(d.provisioning&&d.provisioning.length)
+    h+=`<div class="dep-warn"><b>⚠ GPU capacity</b> — Karpenter can't launch a node:<ul>${d.provisioning.map(e=>`<li>${esc(e.reason)}: ${esc(e.message)}</li>`).join('')}</ul></div>`;
+  if(d.events&&d.events.length)
+    h+=`<div class="sub-title">Recent events</div><div class="ev-list">${d.events.map(e=>`<div class="ev ${e.type==='Warning'?'warn':''}"><span class="ev-r">${esc(e.reason)}</span> <span class="ev-m">${esc(e.message)}</span>${e.count>1?` <span class="muted">×${e.count}</span>`:''}</div>`).join('')}</div>`;
+  if(d.log&&d.log.length)
+    h+=`<div class="sub-title">Model loading · log tail</div><div class="code logtail">${d.log.map(l=>esc(l)).join('\n')}</div>`;
+  return h;
+}
+function scaleBadge(m){const sc=m&&m.scale;if(!sc||!sc.length)return'';const cur=sc.reduce((s,a)=>s+a.current,0),mx=sc.reduce((s,a)=>s+a.max,0);const atMax=sc.some(a=>a.atMax),sat=sc.some(a=>a.saturated);const cls=atMax?'crit':(sat?'warn':'ok');const t=atMax?' · at max, add capacity':(sat?' · scaling up':'');return `<span class="stag ${cls}" title="autoscaling ${cur}/${mx} replicas${t}">⇅ ${cur}/${mx}</span>`;}
+function scaleHTML(m){
+  const sc=m&&m.scale; if(!sc||!sc.length) return '';
+  let h='<div class="sec-title">Autoscaling</div>';
+  sc.forEach(a=>{
+    const label=a.role?a.role.charAt(0).toUpperCase()+a.role.slice(1):'Replicas';
+    const span=Math.max(1,a.max-a.min), pct=Math.round((a.current-a.min)/span*100);
+    const col=a.atMax?'var(--red)':(a.saturated?'var(--amber)':'var(--green)');
+    const tag=a.atMax?'<span class="stag crit">at max · add capacity</span>':(a.saturated?'<span class="stag warn">scaling up</span>':'<span class="stag ok">steady</span>');
+    h+=`<div class="scale-pool"><div class="scale-hd"><b>${esc(label)}</b>${tag}<span class="cnt">${a.current} / ${a.max}${a.current!==a.desired?' → '+a.desired:''} · min ${a.min}</span></div>`;
+    h+=`<div class="scale-bar"><div class="scale-fill" style="width:${Math.min(100,Math.max(4,pct))}%;background:${col}"></div></div>`;
+    h+=`<div class="scale-sig">${esc(a.signal)} &nbsp;<b style="color:${col}">${a.value}</b> / ${a.target} ${esc(a.unit)} target</div>`;
+    const L=v=>v==null?null:(v>=1000?(v/1000).toFixed(v>=10000?0:1)+'s':v+'ms');
+    const lat=a.role==='prefill'?(L(a.ttftMs)?['TTFT p95 '+L(a.ttftMs)]:[])
+             :a.role==='decode'?(L(a.itlMs)?['ITL p95 '+L(a.itlMs)]:[])
+             :[].concat(L(a.ttftMs)?['TTFT '+L(a.ttftMs)]:[], L(a.itlMs)?['ITL '+L(a.itlMs)]:[]);
+    if(lat.length)h+=`<div class="scale-sig">latency (p95) · ${lat.join(' &nbsp;·&nbsp; ')}</div>`;
+    if(a.events&&a.events.length) h+=`<div class="scale-ev">${a.events.map(e=>`<div class="ev">⇅ ${esc(e.msg)} <span class="muted">${relTime(e.ts)} ago</span></div>`).join('')}</div>`;
+    h+='</div>';
+  });
+  return h;
+}
+function openModel(name,keep){const m=(D.models||[]).find(x=>x.name===name);if(!m){closeDrawer();return;}selected=name;selectedNode=null;selectedTeam=null;if(!keep)history.replaceState(null,'','#models/model/'+encodeURIComponent(name));const s=(D.sources||{}).litellm;
+  $('drawer').innerHTML=`<button class="drawer-x" onclick="closeDrawer()">×</button>
+   <div style="display:flex;align-items:center;gap:10px"><span class="dot ${m.status==='running'?'ok':m.status==='error'?'bad':'warn'}"></span><span style="font-size:19px;font-weight:800">${esc(m.name)}</span>${tierBadge(m.tier)}</div>
+   <div class="m-id" style="margin-top:4px">${esc(m.model)}</div>
+   <div class="mini-kpi"><div class="mk"><div class="mkv" style="color:var(--green)">${s?num(m.rpm):'—'}</div><div class="mkl">req/min</div></div><div class="mk"><div class="mkv">${s?ms(m.p95):'—'}</div><div class="mkl">p95</div></div><div class="mk"><div class="mkv">$${(m.costHr||0).toFixed(2)}</div><div class="mkl">$/hr</div></div></div>
+   <div class="sec-title">Configuration</div>
+   <div class="kv"><span class="k">Serving tier</span><span class="v">${tierLabel(m.tier)}</span><span class="k">GPU</span><span class="v">${esc(m.gpu)}</span>${(m.scale&&m.scale.length)?'':(m.prefillReplicas!=null?`<span class="k">Prefill / Decode</span><span class="v">${m.prefillReplicas} / ${m.decodeReplicas} replicas</span>`:(m.replicas!=null?`<span class="k">Replicas</span><span class="v">${m.availableReplicas||0} / ${m.replicas} ready</span>`:''))}${m.router?`<span class="k">llm-d router</span><span class="v">${esc(m.router)}</span>`:''}${s?`<span class="k">Error rate</span><span class="v">${m.errPct==null?'—':m.errPct+'%'}</span><span class="k">Tokens/s</span><span class="v">${num(m.tps)}</span>`:''}${m.health?`<span class="k">Health</span><span class="v">${esc(m.health)}</span>`:''}</div>
+   ${scaleHTML(m)}
+   ${deployHTML(m)}
+   <div class="sec-title">Call it (via LiteLLM)</div>
+   <div class="code">curl $LITELLM/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" \
+  -d '{"model":"${esc(m.name)}","messages":[{"role":"user","content":"Hi"}]}'</div>
+   <div style="display:flex;gap:8px;margin-top:18px"><button class="btn approve" style="flex:1" onclick="openLink('langfuse')">📊 Langfuse</button><button class="btn dismiss" style="flex:1" onclick="openLink('webui')">💬 WebUI</button></div>`;
+  if(!keep){showDrawer();}}
+function closeDrawer(){selected=null;selectedNode=null;selectedTeam=null;$('drawer').classList.remove('open');$('scrim').classList.remove('open');history.replaceState(null,'','#'+curV);const nv=document.querySelector('.nav-item.active');if(nv&&nv.focus)nv.focus();}
+function showDrawer(){$('drawer').classList.add('open');$('scrim').classList.add('open');const c=$('drawer').querySelector('.drawer-x');if(c)c.focus();}
+function openNode(name,keep){
+  const n=(D.nodes||[]).find(x=>x.name===name);if(!n){closeDrawer();return;}
+  selectedNode=name;selected=null;selectedTeam=null;if(!keep)history.replaceState(null,'','#infra/node/'+encodeURIComponent(name));
+  const host=n.name.split('.')[0];
+  const g=(D.gpu||[]).find(x=>x.node===host);
+  const gutil=g&&g.util&&g.util.length?Math.round(g.util.reduce((a,b)=>a+b,0)/g.util.length):null;
+  const gmemA=(g&&g.mem||[]).filter(x=>x!=null);const gmem=gmemA.length?Math.round(gmemA.reduce((s,x)=>s+x,0)/gmemA.length):null;
+  const np=(D.pods||[]).filter(p=>p.node===name);
+  const cpuReq=np.reduce((s,p)=>s+(p.cpuReqM||0),0),memReq=np.reduce((s,p)=>s+(p.memReqMi||0),0);
+  const cpuA=n.cpuAllocM||0,memA=n.memAllocMi||0;
+  const cpuPct=cpuA?Math.round(cpuReq/cpuA*100):0,memPct=memA?Math.round(memReq/memA*100):0;
+  const cpuUsed=n.cpuUsedM,memUsed=n.memUsedMi;
+  const cpuUsedPct=(cpuUsed!=null&&cpuA)?Math.round(cpuUsed/cpuA*100):null,memUsedPct=(memUsed!=null&&memA)?Math.round(memUsed/memA*100):null;
+  const byNs={};np.forEach(p=>{(byNs[p.namespace]=byNs[p.namespace]||[]).push(p);});
+  const nsList=Object.keys(byNs).sort((a,b)=>byNs[b].length-byNs[a].length);
+  const bar=(pct,col)=>`<div class="bar" style="margin-top:5px"><i style="width:${Math.min(100,Math.max(2,pct))}%;background:${col}"></i></div>`;
+  const usage=`<div class="sec-title">Usage</div>`
+    +`<div class="bar-lbl"><span>GPU util${g&&g.model?' · '+esc(g.model):''}</span><span>${gutil==null?'—':gutil+'%'}</span></div>`
+    +(n.gpu>0?bar(gutil||0,(gutil||0)>85?'var(--amber)':'var(--green)'):'<div class="util" style="margin:2px 0 4px">no GPU on this node</div>')
+    +(n.gpu>0?`<div class="bar-lbl" style="margin-top:8px"><span>GPU memory</span><span>${gmem==null?'—':gmem+'%'}</span></div>`+bar(gmem||0,(gmem||0)>90?'var(--amber)':'var(--purple)'):'')
+    +`<div class="bar-lbl" style="margin-top:11px"><span>CPU${cpuUsedPct!=null?'':' requested'}</span><span>${cpuUsedPct!=null?`${(cpuUsed/1000).toFixed(2)} / ${(cpuA/1000).toFixed(1)} cores · ${cpuUsedPct}%`:`${(cpuReq/1000).toFixed(1)} / ${(cpuA/1000).toFixed(1)} cores · ${cpuPct}%`}</span></div>`
+    +bar(cpuUsedPct!=null?cpuUsedPct:cpuPct,(cpuUsedPct||cpuPct)>85?'var(--amber)':'var(--accent)')
+    +(cpuUsedPct!=null?`<div class="np-sub">requested ${(cpuReq/1000).toFixed(1)} cores · ${cpuPct}%</div>`:'')
+    +`<div class="bar-lbl" style="margin-top:11px"><span>Memory${memUsedPct!=null?'':' requested'}</span><span>${memUsedPct!=null?`${(memUsed/1024).toFixed(1)} / ${(memA/1024).toFixed(1)} GiB · ${memUsedPct}%`:`${(memReq/1024).toFixed(1)} / ${(memA/1024).toFixed(1)} GiB · ${memPct}%`}</span></div>`
+    +bar(memUsedPct!=null?memUsedPct:memPct,(memUsedPct||memPct)>85?'var(--amber)':'var(--cyan)')
+    +(memUsedPct!=null?`<div class="np-sub">requested ${(memReq/1024).toFixed(1)} GiB · ${memPct}%</div>`:'');
+  const legend=nsList.length?`<div class="ns-legend">${nsList.map(ns=>`<span><i style="background:${nsColor(ns)}"></i>${esc(ns)} (${byNs[ns].length})</span>`).join('')}</div>`:'';
+  const podsHtml=nsList.length?nsList.map(ns=>byNs[ns].map(p=>`<div class="np-row"><span class="np-dot" style="background:${nsColor(ns)}"></span><span class="np-name">${esc(p.name)}</span><span class="np-meta">${p.gpu?p.gpu+'×GPU ':''}${p.phase!=='Running'?esc(p.phase):''}</span></div>`).join('')).join(''):'<div class="muted" style="padding:6px 0">No pods scheduled</div>';
+  const age=relTime(n.created);
+  $('drawer').innerHTML=`<button class="drawer-x" onclick="closeDrawer()">×</button>
+   <div style="display:flex;align-items:center;gap:10px"><span class="dot ok"></span><span style="font-size:19px;font-weight:800">${esc(host)}</span><span class="badge2 b-ray" style="background:var(--accent-soft);color:#c7d2fe">${esc(n.capacity||'')}</span></div>
+   <div class="m-id" style="margin-top:4px">${esc(n.instance)}${n.gpuProduct?' · '+esc(n.gpuProduct):''}</div>
+   <div class="mini-kpi"><div class="mk"><div class="mkv" style="color:var(--purple)">${gutil==null?'—':gutil+'%'}</div><div class="mkl">GPU util</div></div><div class="mk"><div class="mkv">${np.length}</div><div class="mkl">pods</div></div><div class="mk"><div class="mkv">$${(n.hourly||0).toFixed(2)}</div><div class="mkl">$/hr</div></div></div>
+   <div class="sec-title">Node</div>
+   <div class="kv"><span class="k">Instance</span><span class="v">${esc(n.instance)}</span><span class="k">Capacity</span><span class="v">${esc(n.capacity||'')}</span><span class="k">GPUs</span><span class="v">${n.gpu||0}</span><span class="k">Zone</span><span class="v">${esc(n.zone||'')}</span><span class="k">Nodepool</span><span class="v">${esc(n.pool==='__mng__'?'managed node group':n.pool)}</span>${age?`<span class="k">Age</span><span class="v">${esc(age)}</span>`:''}</div>
+   ${usage}
+   <div class="sec-title">Pods by namespace <span class="muted" style="font-weight:500;text-transform:none;letter-spacing:0">· ${np.length} on node</span></div>
+   ${legend}${podsHtml}`;
+  if(!keep){showDrawer();}}
+function openTeam(name,keep){const t=(D.teams||[]).find(x=>x.name===name||x.id===name);if(!t){closeDrawer();return;}
+  selectedTeam=t.name;selected=null;selectedNode=null;if(!keep)history.replaceState(null,'','#teams/team/'+encodeURIComponent(t.name));
+  const pct=t.limit?Math.min(100,Math.round(t.budget/t.limit*100)):null;
+  const bar=(p,col)=>`<div class="bar" style="margin-top:5px"><i style="width:${Math.min(100,Math.max(2,p))}%;background:${col}"></i></div>`;
+  $('drawer').innerHTML=`<button class="drawer-x" onclick="closeDrawer()">×</button>
+   <div style="display:flex;align-items:center;gap:10px"><span style="font-size:17px">◐</span><span style="font-size:19px;font-weight:800">${esc(t.name)}</span></div>
+   <div class="m-id" style="margin-top:4px">namespace: team-${esc(t.name)}</div>
+   <div class="mini-kpi"><div class="mk"><div class="mkv" style="color:var(--green)">${num(t.reqsToday||0)}</div><div class="mkl">req today</div></div><div class="mk"><div class="mkv">$${(t.spendToday||0).toFixed(2)}</div><div class="mkl">spend today</div></div><div class="mk"><div class="mkv">${t.keys||0}</div><div class="mkl">API keys</div></div></div>
+   <div class="sec-title">Budget</div>
+   <div class="bar-lbl"><span>${t.limit?'used of cap':'spend (no cap set)'}</span><span>${t.limit?`$${(t.budget||0).toFixed(2)} / $${t.limit.toFixed(0)} · ${pct}%`:`$${(t.budget||0).toFixed(2)}`}</span></div>
+   ${t.limit?bar(pct,pct>80?'var(--amber)':'var(--green)'):''}
+   <div class="sec-title">Today</div>
+   <div class="kv"><span class="k">Requests</span><span class="v">${num(t.reqsToday||0)}</span><span class="k">Failed</span><span class="v">${t.failed||0}</span><span class="k">Tokens</span><span class="v">${num(t.tokens||0)}</span><span class="k">Spend</span><span class="v">$${(t.spendToday||0).toFixed(2)}</span><span class="k">API keys</span><span class="v">${t.keys||0}</span></div>
+   <div class="sec-title">Call it (via LiteLLM)</div>
+   <div class="code">curl $LITELLM/v1/chat/completions \\
+  -H "Authorization: Bearer $TEAM_KEY" \\
+  -d '{"model":"<model>","messages":[{"role":"user","content":"Hi"}]}'</div>`;
+  if(!keep){showDrawer();}}
+function doSearch(q){q=(q||'').trim().toLowerCase();const res=$('q-res');if(!res)return;if(!q){res.className='q-res';res.innerHTML='';lastSearch=[];return;}
+  const items=[];
+  (D.models||[]).forEach(m=>{if((m.name||'').toLowerCase().includes(q)||(m.model||'').toLowerCase().includes(q))items.push({type:'model',name:m.name,label:m.name,sub:m.model||''});});
+  (D.nodes||[]).forEach(n=>{const h=n.name.split('.')[0];if(h.toLowerCase().includes(q)||(n.instance||'').toLowerCase().includes(q))items.push({type:'node',name:n.name,label:h,sub:n.instance||''});});
+  (D.teams||[]).forEach(t=>{if((t.name||'').toLowerCase().includes(q)||(t.id||'').toLowerCase().includes(q))items.push({type:'team',name:t.name||t.id,label:t.name||t.id,sub:'team'});});
+  lastSearch=items.slice(0,8);
+  res.innerHTML=lastSearch.length?lastSearch.map((it,i)=>`<div class="q-item${i===0?' sel':''}" onmousedown="pickSearch(${i})"><b>${esc(it.label)}</b> <span class="muted" style="font-size:11px">${esc(it.sub)}</span><span class="q-type">${it.type}</span></div>`).join(''):'<div class="q-item muted">No matches</div>';
+  res.className='q-res open';}
+function pickSearch(i){const it=lastSearch[i];if(!it)return;const inp=$('q');if(inp)inp.value='';$('q-res').className='q-res';
+  if(it.type==='model'){go('models',document.querySelectorAll('.nav-item')[1]);openModel(it.name);}
+  else if(it.type==='node'){go('infra',document.querySelectorAll('.nav-item')[4]);openNode(it.name);}
+  else if(it.type==='team'){go('teams',document.querySelectorAll('.nav-item')[2]);openTeam(it.name);}}
+function searchGo(){if(lastSearch.length)pickSearch(0);}
+function go(v,el){document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));$('v-'+v).classList.add('active');document.querySelectorAll('.nav-item').forEach(x=>x.classList.remove('active'));if(el)el.classList.add('active');document.querySelector('.main').scrollTop=0;curV=v;history.replaceState(null,'','#'+v);}
+function toggleTheme(){const b=document.body,n=b.getAttribute('data-theme')==='light'?'dark':'light';b.setAttribute('data-theme',n);localStorage.setItem('theme',n);}
+const saved=localStorage.getItem('theme');if(saved)document.body.setAttribute('data-theme',saved);
+poll();setInterval(poll,5000);
+document.addEventListener('keydown',e=>{if(e.key==='Escape'){const r=document.getElementById('q-res');if(r&&r.classList.contains('open')){r.className='q-res';}else{closeDrawer();}}});
+function routeFromHash(){const parts=(location.hash||'').replace(/^#/,'').split('/');const v=parts[0];if(!NAVIX.hasOwnProperty(v))return;go(v,document.querySelectorAll('.nav-item')[NAVIX[v]]);const type=parts[1],name=parts[2]?decodeURIComponent(parts[2]):null;if(type&&name){if(type==='model')openModel(name);else if(type==='node')openNode(name);else if(type==='team')openTeam(name);}}
+window.addEventListener('hashchange',routeFromHash);
+document.querySelectorAll('.nav-item').forEach(n=>{n.tabIndex=0;n.setAttribute('role','button');n.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();n.click();}});});
+document.addEventListener('keydown',function(e){if(e.key!=='Tab')return;var dr=document.getElementById('drawer');if(!dr.classList.contains('open'))return;var f=Array.prototype.slice.call(dr.querySelectorAll('button,a[href],input,[tabindex]')).filter(function(x){return x.offsetParent!==null;});if(!f.length)return;var first=f[0],last=f[f.length-1];if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}});
+
+</script>
+</body>
+</html>

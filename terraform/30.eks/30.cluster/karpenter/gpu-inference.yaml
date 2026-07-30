@@ -1,0 +1,130 @@
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-inference
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  metadataOptions:
+    # Hop limit 2 required so Bottlerocket's pluto (containerised) can reach
+    # IMDS to fetch the private DNS name during bootstrap.
+    httpPutResponseHopLimit: 2
+    httpTokens: required
+    httpEndpoint: enabled
+  role: ${role}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Name: ${cluster_name}-private-*
+        Environment: ${environment}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Environment: ${environment}
+  blockDeviceMappings:
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: ${gpu_volume_size}Gi
+        volumeType: gp3
+        encrypted: true
+        throughput: 500
+        iops: 6000
+        ${gpu_snapshot_id_line}
+  userData: |
+    [settings.container-runtime]
+    snapshotter = "soci"
+    # Classic SOCI lazy-loading (FUSE). We deliberately do NOT enable
+    # `pull-mode = "parallel-pull-unpack"`: PPU eagerly downloads + unpacks all
+    # layers concurrently and the Bottlerocket snapshotter PANICS mid-unpack on
+    # large multi-GB-layer images (e.g. the vLLM serving image), surfacing to
+    # the kubelet as
+    # "reading from server: EOF". The EBS data-volume snapshot is baked with
+    # bare `snapshotter = "soci"` too, so this matches the baked content store
+    # and keeps vLLM image cold-start at ~0s. Large GPU images should be pre-baked
+    # into the snapshot (image-optimization.tf); the SOCI index is the fallback.
+  tags:
+    karpenter.sh/discovery: ${cluster_name}
+    Environment: ${environment}
+    workload-type: gpu-inference
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-inference
+spec:
+  weight: 50
+  template:
+    metadata:
+      labels:
+        workload-type: gpu-inference
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-inference
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+      # All NVIDIA-backed AWS GPU instance categories (G and P families).
+      # Karpenter's scheduler already bin-packs to cheapest-fit, so we don't
+      # enumerate families — new ones (g7, p6, ...) become eligible automatically.
+      # Cost blast-radius is bounded by `limits.nvidia.com/gpu` below.
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["g", "p"]
+        - key: karpenter.k8s.aws/instance-gpu-manufacturer
+          operator: In
+          values: ["nvidia"]
+        # Exclude pre-Ampere NVIDIA GPUs (T4 in g4dn, V100 in p3/p3dn/p2). Modern
+        # vLLM model defaults (and quantized formats like gpt_oss_mxfp4) require
+        # compute capability >= 8.0 (Ampere/Ada/Hopper). T4 is CC 7.5, V100 is CC
+        # 7.0.
+        #
+        # The family-name list below is NOT sufficient on its own: AWS gives GPU
+        # variants their OWN family string rather than reusing the base family —
+        # p3dn.24xlarge (still V100/CC 7.0) reports instance-family=p3dn, which
+        # does not match "p3" and slipped through this exclusion (observed live:
+        # Karpenter provisioned a p3dn.24xlarge for a gpt-oss-20b deploy, which
+        # then crash-looped on vLLM's "quantization method ... not supported for
+        # the current GPU" check). The generation floor right below is the real
+        # guard — it's numeric and immune to family-name spelling — kept both for
+        # defense in depth and because the family list still narrows the search
+        # space Karpenter considers.
+        - key: karpenter.k8s.aws/instance-family
+          operator: NotIn
+          values: ["g4dn", "g4ad", "p3", "p3dn", "p2"]
+        # Ampere is generation 5 in G-family numbering (g5/g6/g6e/g7e are all
+        # >= 5); P3(dn) is generation 3, P2 is generation 2 — both correctly
+        # excluded by this floor regardless of what AWS names the variant.
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gte
+          values: ["5"]
+        # No instance-size cap. Multi-GPU serving (tensor/pipeline parallelism,
+        # i.e. gpuCount 2/4/8) needs the multi-GPU node sizes: for g5/g6/g6e the
+        # 4-GPU variant is *.12xlarge and the 8-GPU is *.48xlarge. Capping at
+        # 8xlarge restricted these families to their single-GPU sizes, so ANY
+        # gpuCount>1 pod was unschedulable ("no instance type has enough
+        # resources"). We omit the size constraint instead of enumerating sizes
+        # (same rationale as families above): Karpenter bin-packs cheapest-fit,
+        # so a 1-GPU pod still lands on a 1-GPU xlarge and a 4-GPU pod on a
+        # 12xlarge, while total spend stays bounded by limits.nvidia.com/gpu.
+  # Cost cap: max 16 NVIDIA GPUs provisioned by this NodePool at any time.
+  # With P5 at 8 GPUs/node this caps worst-case hourly spend; raise/lower to taste.
+  limits:
+    nvidia.com/gpu: "16"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 300s
+    budgets:
+      - nodes: "1"

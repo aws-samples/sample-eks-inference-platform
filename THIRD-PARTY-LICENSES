@@ -1,0 +1,91 @@
+The "AI Platform on EKS" project deploys the following third-party software. This
+file records attribution and licensing.
+
+This repository does NOT vendor (copy in) any third-party source. Everything
+below is **deployed or fetched at runtime** — components this project pulls from
+their official container registries, Helm repositories, or (for the Gateway API
+Inference Extension CRDs) a pinned upstream Git tag at deploy time. This
+repository does not redistribute them; it references them by image tag, chart
+version, or Git tag. They remain under their own licenses, listed here for
+attribution and operator awareness. Verify the exact license of the pinned
+version before you rely on it.
+
+================================================================================
+SOFTWARE DEPLOYED / FETCHED AT RUNTIME (referenced, not redistributed)
+================================================================================
+
+** Gateway API Inference Extension (CRDs) — https://github.com/kubernetes-sigs/gateway-api-inference-extension
+   Fetched at sync time from a pinned tag (currently v1.5.0), NOT vendored:
+   platform/services/inference-gateway/kustomization.yaml references
+   `.../config/crd?ref=v1.5.0`; ArgoCD runs kustomize build to install the CRDs
+   (group inference.networking.x-k8s.io / inference.networking.k8s.io).
+   Copyright The Kubernetes Authors. License: Apache-2.0.
+
+
+Container images (pinned tags in platform/services/**):
+
+  ** vLLM — https://github.com/vllm-project/vllm
+     image: vllm/vllm-openai (the serving engine behind all three tiers)
+     License: Apache-2.0
+
+  ** LiteLLM — https://github.com/BerriAI/litellm
+     image: litellm/litellm:v1.81.9-stable.patch.1
+     License: MIT
+
+  ** Open WebUI — https://github.com/open-webui/open-webui
+     image: ghcr.io/open-webui/open-webui:v0.10.2
+     License: Open WebUI License (BSD-3-Clause + branding-protection clause).
+     ** NOT a standard OSI license. ** Removing/altering the "Open WebUI"
+     branding is a material breach for deployments over 50 users; deployments of
+     50 or fewer users may rebrand. Operators who run this sample pull that image
+     and are subject to these terms.
+
+  ** Langfuse — https://github.com/langfuse/langfuse
+     deployed via the langfuse Helm chart (observability/tracing)
+     License: MIT for the core; some enterprise ("ee") features are under a
+     separate commercial license. This project deploys the OSS core (no "ee"
+     feature is enabled by default).
+
+  ** oauth2-proxy — https://github.com/oauth2-proxy/oauth2-proxy
+     image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+     License: MIT
+
+  ** curl (container) — https://github.com/curl/curl-container ; https://curl.se
+     image: curlimages/curl (health/probe helpers)
+     License: curl license (MIT/X-style)
+
+Helm charts / platform components (pulled at deploy time):
+
+  ** NVIDIA GPU Operator — https://github.com/NVIDIA/gpu-operator          License: Apache-2.0
+  ** Argo CD (argo-helm) — https://github.com/argoproj/argo-cd             License: Apache-2.0
+  ** KRO (Kube Resource Orchestrator) — https://github.com/kro-run/kro     License: Apache-2.0
+  ** Karpenter — https://github.com/aws/karpenter-provider-aws             License: Apache-2.0
+  ** llm-d (llm-d-router-standalone) — https://github.com/llm-d/llm-d      License: Apache-2.0
+  ** AWS EKS Blueprints Addons — https://github.com/aws-ia/terraform-aws-eks-blueprints-addons  License: Apache-2.0
+
+Infrastructure baseline:
+
+  ** This project extends "Automated Provisioning of Application-Ready Amazon EKS
+     Clusters" from the AWS Solutions Library (see README Acknowledgments).
+     License: Apache-2.0 / MIT-0 per the source samples.
+
+--------------------------------------------------------------------------------
+The MIT License (applies to the MIT-licensed components above)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in the
+Software without restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the
+Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+--------------------------------------------------------------------------------

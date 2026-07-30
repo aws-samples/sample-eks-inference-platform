@@ -1,0 +1,93 @@
+# Opt-in prefill NodePool for the disaggregated (LLMDDisaggEndpoint) tier.
+# Prefill is COMPUTE-bound (bursty prompt processing → drives TTFT), so this pool
+# is restricted to high-FLOPS, fp8-capable families (Ada L40S, Ampere A100,
+# Hopper H100/H200). A disagg endpoint opts in by setting `prefillNodePool:
+# gpu-prefill`; by default it stays on the shared `gpu-inference` pool. The
+# split only pays off for large models (≥~30B) under sustained multi-replica
+# decode.
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-prefill
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  metadataOptions:
+    httpPutResponseHopLimit: 2
+    httpTokens: required
+    httpEndpoint: enabled
+  role: ${role}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Name: ${cluster_name}-private-*
+        Environment: ${environment}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Environment: ${environment}
+  blockDeviceMappings:
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: ${gpu_volume_size}Gi
+        volumeType: gp3
+        encrypted: true
+        throughput: 500
+        iops: 6000
+        ${gpu_snapshot_id_line}
+  userData: |
+    [settings.container-runtime]
+    snapshotter = "soci"
+    # Match gpu-inference: bare SOCI snapshotter (no parallel-pull-unpack) to
+    # match the baked EBS data-volume snapshot's content store.
+  tags:
+    karpenter.sh/discovery: ${cluster_name}
+    Environment: ${environment}
+    workload-type: gpu-prefill
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-prefill
+spec:
+  weight: 50
+  template:
+    metadata:
+      labels:
+        workload-type: gpu-prefill
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-prefill
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: karpenter.k8s.aws/instance-gpu-manufacturer
+          operator: In
+          values: ["nvidia"]
+        # Compute-optimized, fp8-capable families only. Prefill wants FLOPS, not
+        # the cheap low-bandwidth GPUs (L4/A10G) that suit decode. Karpenter
+        # cheapest-fits within this set to the pod's gpuCount/minVramPerGpuGiB,
+        # so a 30B lands on g6e (L40S) while a 70B+ can reach p5 (H100).
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["g6e", "p4d", "p4de", "p5", "p5e", "p5en"]
+  limits:
+    nvidia.com/gpu: "16"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 300s
+    budgets:
+      - nodes: "1"

@@ -1,0 +1,565 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: ai-platform
+  labels:
+    app: litellm
+spec:
+  # 2 replicas: LiteLLM is the single front door for ALL inference (Open WebUI,
+  # every team API key, the Bedrock path), and it's stateless (state lives in
+  # platform-db), so a second replica removes it as a single point of failure and
+  # makes the PodDisruptionBudget below meaningful (maxUnavailable:1 on 1 replica
+  # was a no-op). Requests are idempotent proxy calls, so round-robin is fine.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      # ServiceAccount carries the Bedrock IRSA role when enable_bedrock=true
+      # (annotation injected by Terraform). Without it, this is a plain SA with
+      # no AWS access — equivalent to `default`, so non-Bedrock installs are
+      # unaffected. The EKS Pod Identity webhook injects AWS_REGION here when
+      # the role annotation is present, which the Bedrock model config reads.
+      serviceAccountName: litellm
+      containers:
+        - name: litellm
+          image: litellm/litellm:v1.81.9-stable.patch.1
+          args: ["--config", "/app/config.yaml"]
+          ports:
+            - containerPort: 4000
+          env:
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: master-key
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: platform-db-credentials
+                  key: litellm-url
+            - name: STORE_MODEL_IN_DB
+              value: "True"
+            # Region for the Bedrock provider. Sourced from a Terraform-managed
+            # ConfigMap (created with the cluster) so it's never hardcoded in git.
+            # optional:true keeps LiteLLM bootable on installs where the ConfigMap
+            # isn't present (non-Terraform/dev) — Bedrock calls would then 4xx,
+            # but self-hosted models are unaffected.
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: litellm-env
+                  key: AWS_REGION
+                  optional: true
+            # Langfuse callback is enabled via litellm_settings.success_callback
+            # in the config (not an env var). These provide the credentials it uses.
+            - name: LANGFUSE_HOST
+              value: "http://langfuse-web.ai-platform.svc.cluster.local:3000"
+            - name: LANGFUSE_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-litellm-keys
+                  key: LANGFUSE_PUBLIC_KEY
+                  optional: true
+            - name: LANGFUSE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: langfuse-litellm-keys
+                  key: LANGFUSE_SECRET_KEY
+                  optional: true
+            # --- Admin UI SSO (Cognito OIDC) ---
+            # Optional refs: until Terraform (enable_sso) creates `sso-secrets`,
+            # these are unset and the UI falls back to master-key login.
+            - name: GENERIC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: litellm-client-id
+                  optional: true
+            - name: GENERIC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: litellm-client-secret
+                  optional: true
+            - name: GENERIC_AUTHORIZATION_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: authorize-url
+                  optional: true
+            - name: GENERIC_TOKEN_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: token-url
+                  optional: true
+            - name: GENERIC_USERINFO_ENDPOINT
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: userinfo-url
+                  optional: true
+            - name: PROXY_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: litellm-public-url
+                  optional: true
+            # Promote the SSO seed admin (user_id == email) to proxy_admin on boot.
+            # Group-based admin mapping for additional admins would need a Cognito
+            # pre-token Lambda emitting a role claim + GENERIC_USER_ROLE_ATTRIBUTE.
+            - name: PROXY_ADMIN_ID
+              valueFrom:
+                secretKeyRef:
+                  name: sso-secrets
+                  key: admin-user-id
+                  optional: true
+            # Group-aligned role from userInfo (custom:role); admin/dev/user ->
+            # proxy_admin/internal_user/internal_user_view_only.
+            - name: GENERIC_USER_ROLE_ATTRIBUTE
+              value: "custom:role"
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+          readinessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 4000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+      volumes:
+        - name: config
+          configMap:
+            name: litellm-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-config
+  namespace: ai-platform
+data:
+  config.yaml: |
+    # Two model sources merge at runtime:
+    #   1. Static models declared here (committed to git) — e.g. Bedrock, which
+    #      has nothing to deploy/scale, so it needs no serving CR.
+    #   2. Self-hosted models registered dynamically via the LiteLLM API
+    #      (POST /model/new) by the litellm-sync controller, which watches the
+    #      serving-tier CRs (VLLMEndpoint/LLMDEndpoint/LLMDDisaggEndpoint) and
+    #      registers/deregisters each model centrally.
+    # LiteLLM merges this model_list with DB-registered models (STORE_MODEL_IN_DB=True).
+    model_list:
+      # Amazon Bedrock — Claude Opus 4.8 (the frontier commercial baseline).
+      # Static endpoint: zero GPUs, no serving CR. Auth comes from the
+      # `litellm` ServiceAccount's IRSA role (terraform: enable_bedrock=true) —
+      # no static keys. The `global.` prefix selects the region-agnostic
+      # cross-region inference profile (works in any region; swap to `eu.`/`us.`
+      # to pin a geography). Verify the exact model ID + region availability in
+      # the Bedrock console; it's a one-line edit. Requires Bedrock model access
+      # enabled in-account (a one-time console toggle) — `./platformctl status --check` validates it.
+      - model_name: claude-opus-4-8
+        litellm_params:
+          model: bedrock/global.anthropic.claude-opus-4-8
+          aws_region_name: os.environ/AWS_REGION
+    litellm_settings:
+      # Register the Langfuse callback HERE — this is the only place LiteLLM
+      # reads it. (There is no LITELLM_CALLBACKS env var; setting one is a no-op.)
+      # With langfuse listed, LiteLLM picks up LANGFUSE_PUBLIC_KEY / SECRET_KEY /
+      # HOST from the env wired in the Deployment and traces every request.
+      success_callback: ["langfuse"]
+      # Prometheus metrics (per-model request counters) power llm-d scale-to-zero.
+      # LiteLLM is the front door: it sees every request BEFORE it reaches the
+      # llm-d EPP, so its request counter increments even when the pool is scaled
+      # to zero (the EPP 503s before it would count anything). The autoscaling
+      # Prometheus scrapes /metrics and KEDA uses the per-model arrival rate to
+      # wake a zero'd pool. `callbacks` applies to success AND failure, so a
+      # request that arrives while the pool is cold is still counted.
+      callbacks: ["prometheus"]
+      # Per-user cost attribution: capture the identity Open WebUI forwards
+      # (via ENABLE_FORWARD_USER_INFO_HEADERS) as spend tags, so spend reports
+      # break down per user without issuing per-user API keys. Inert when the
+      # headers are absent (e.g. direct API calls).
+      extra_spend_tag_headers: ["x-openwebui-user-id", "x-openwebui-user-email"]
+      # Cold-start hold: when a pool is at zero, the request that triggers the
+      # wake-up retries while KEDA scales it up (Karpenter node + model load,
+      # ~1-2 min) — turning the cold start into added latency rather than an error.
+      num_retries: 5
+      request_timeout: 120
+      # --- Per-user budgets & rate limits (self-service governance) ---
+      # 1a — Open WebUI chat path. Open WebUI authenticates to LiteLLM with the
+      # shared master key and forwards the signed-in identity as the
+      # x-openwebui-user-email header (see general_settings.user_header_mappings
+      # below, which maps it to LiteLLM's "customer"/end-user). This applies a
+      # per-person $ budget AND rpm/tpm throttle WITHOUT issuing per-user keys.
+      # The actual limits live on the `end-user-default` budget tier, created
+      # idempotently by the litellm-enduser-budget Job (POST /budget/new) further
+      # down. Referencing a budget id that doesn't exist yet is inert (it's a
+      # per-request DB lookup, not validated at boot), so this stays push-safe:
+      # until the Job runs, end-user requests are simply unmetered.
+      max_end_user_budget_id: "end-user-default"
+      # 1b — direct API / virtual-key path. SSO users who sign in to the LiteLLM
+      # UI are internal_users (role from custom:role — see GENERIC_USER_ROLE_ATTRIBUTE);
+      # give them a default personal budget and cap any key they mint themselves.
+      # (Open WebUI traffic rides the master key, so these bound programmatic/API
+      # use, not the chat path — that's what 1a above covers.) We deliberately do
+      # NOT set default_internal_user_params.user_role here: role must stay driven
+      # by custom:role, or the seed admin would be downgraded to internal_user.
+      max_internal_user_budget: 10           # USD default budget per internal user
+      internal_user_budget_duration: "30d"   # ...reset every 30 days
+      upperbound_key_generate_params:        # ceiling for self-served /key/generate
+        max_budget: 10
+        budget_duration: "30d"
+        rpm_limit: 60
+        tpm_limit: 100000
+    general_settings:
+      master_key: os.environ/LITELLM_MASTER_KEY
+      # Identify the per-user "customer" (end-user) from the header Open WebUI
+      # forwards, so the end-user budget/limits (max_end_user_budget_id above)
+      # apply on the chat path without per-user keys. LiteLLM natively only
+      # checks x-litellm-customer-id / x-litellm-end-user-id; this maps our
+      # forwarded header into that resolution (ranks above the body `user` field,
+      # which Open WebUI does not send). Inert for callers that omit the header.
+      user_header_mappings:
+        - header_name: "x-openwebui-user-email"
+          litellm_user_role: "customer"
+---
+# litellm-enduser-budget — creates the default "customer" (end-user) budget tier
+# that max_end_user_budget_id references. Runs as a post-sync hook: it waits for
+# LiteLLM to be live, then idempotently POSTs /budget/new. Re-running when the
+# budget already exists is a no-op (LiteLLM returns an error which we swallow),
+# so it's safe on every sync. Editing the limits below + re-syncing does NOT
+# update the existing budget — change it via POST /budget/update or the UI, or
+# delete the budget and let this recreate it.
+#
+# Push-safe: needs only the litellm master key (always present) and the in-cluster
+# LiteLLM Service. If LiteLLM never comes up the Job just retries and fails
+# harmlessly without affecting any running pod.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: litellm-enduser-budget
+  namespace: ai-platform
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 20
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed-budget
+          image: curlimages/curl:8.21.0
+          env:
+            - name: MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-secrets
+                  key: master-key
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              BASE=http://litellm.ai-platform.svc.cluster.local:4000
+              echo "Waiting for LiteLLM..."
+              for i in $(seq 1 60); do
+                if curl -fsS "$BASE/health/liveliness" >/dev/null 2>&1; then break; fi
+                sleep 5
+              done
+              # Default per-end-user tier: $10 / 30d + 60 rpm + 100k tpm. Applied
+              # to every "customer" (Open WebUI user) that has no explicit budget.
+              code=$(curl -s -o /tmp/resp -w '%{http_code}' -X POST "$BASE/budget/new" \
+                -H "Authorization: Bearer $MASTER_KEY" \
+                -H "Content-Type: application/json" \
+                -d '{"budget_id":"end-user-default","max_budget":10,"budget_duration":"30d","rpm_limit":60,"tpm_limit":100000}')
+              echo "POST /budget/new -> HTTP $code"; cat /tmp/resp 2>/dev/null || true; echo
+              case "$code" in
+                2*) echo "created end-user-default budget";;
+                *)  echo "budget likely already exists (HTTP $code) — treating as success";;
+              esac
+              exit 0
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: litellm
+  namespace: ai-platform
+spec:
+  type: ClusterIP
+  selector:
+    app: litellm
+  ports:
+    - port: 4000
+      targetPort: 4000
+      name: http
+---
+# Init script: creates additional databases on first PostgreSQL boot.
+# Runs via docker-entrypoint-initdb.d (only on empty data directory).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-db-init
+  namespace: ai-platform
+data:
+  create-databases.sql: |
+    CREATE DATABASE langfuse;
+---
+# Shared PostgreSQL for all platform services (LiteLLM, Langfuse).
+# Credentials managed by Terraform (platform-db-credentials secret).
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: platform-db
+  namespace: ai-platform
+spec:
+  serviceName: platform-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platform-db
+  template:
+    metadata:
+      labels:
+        app: platform-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16.14-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: platform-db-credentials
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-db-credentials
+                  key: password
+            - name: POSTGRES_DB
+              value: "litellm"
+            - name: PGDATA
+              value: "/var/lib/postgresql/data/pgdata"
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+          # Probes so a wedged Postgres is actually noticed. Without a readiness
+          # probe the pod stays Ready (and keeps its Service Endpoints) even when
+          # the DB is not accepting connections, so every client — LiteLLM auth
+          # on EVERY request, Langfuse, the dashboard — hangs instead of failing
+          # over; without a liveness probe a hung postmaster is never restarted.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"']
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", 'pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"']
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: platform-db-init
+  volumeClaimTemplates:
+    # Make these fields explicit in source so ArgoCD's diff doesn't flag them
+    # against the API-server-injected defaults on the live PVC template.
+    - apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        volumeMode: Filesystem
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: platform-db
+  namespace: ai-platform
+spec:
+  selector:
+    app: platform-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: platform-db
+  namespace: ai-platform
+spec:
+  podSelector:
+    matchLabels:
+      app: platform-db
+  policyTypes:
+    - Ingress
+  ingress:
+    # Postgres is reachable ONLY from the ai-platform namespace — every DB
+    # client (LiteLLM, Langfuse, the dashboard backend/event-watcher, and the
+    # Platform Health Agent Jobs) runs there. Previously this admitted any
+    # namespace carrying app.kubernetes.io/part-of=ai-platform, which every
+    # tenant namespace also carries — so team workloads could open connections
+    # straight to the platform state store (LiteLLM keys, budgets, Langfuse,
+    # PHA findings). Selecting by the immutable namespace-name label closes that
+    # and does not depend on any custom namespace labelling.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ai-platform
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: litellm
+  namespace: ai-platform
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: litellm
+---
+# --- platform-db backup (opt-in) ---
+# The shared Postgres is a single in-cluster replica holding LiteLLM keys/budgets,
+# Langfuse, and Platform Health Agent state — losing it loses all of that. This
+# CronJob takes a full pg_dumpall and uploads it to S3. It ships SUSPENDED because
+# the backup destination is environment-specific; enabling it is a 3-step,
+# fork-local change (see the CronJob comment). RPO = the schedule interval.
+# For PRODUCTION, prefer Amazon RDS (managed automated backups + point-in-time
+# recovery + Multi-AZ) over backing up a single-replica in-cluster Postgres.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-db-backup
+  namespace: ai-platform
+  # To enable uploads, grant this SA s3:PutObject on your backup bucket via
+  # IRSA / EKS Pod Identity (Terraform can add the eks.amazonaws.com/role-arn
+  # annotation). Left unannotated by default (backups are opt-in).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: platform-db-backup-config
+  namespace: ai-platform
+data:
+  # Destination S3 bucket for backups. Empty by default — set it (and enable the
+  # CronJob) to turn backups on. Example: "my-org-ai-platform-backups".
+  bucket: ""
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: platform-db-backup
+  namespace: ai-platform
+spec:
+  # SUSPENDED by default. To enable: (1) create an S3 bucket and grant the
+  # platform-db-backup ServiceAccount s3:PutObject on it (IRSA/Pod Identity);
+  # (2) set `bucket` in the platform-db-backup-config ConfigMap above;
+  # (3) set suspend: false here. RPO = the schedule interval (daily below).
+  suspend: true
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          serviceAccountName: platform-db-backup
+          restartPolicy: OnFailure
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            fsGroup: 65532          # so the non-root uid can write the emptyDir
+          # pg_dumpall (superuser client) writes a gzip to the shared emptyDir…
+          initContainers:
+            - name: dump
+              image: postgres:16.14-alpine
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  ts=$(date +%Y%m%d-%H%M%S)
+                  pg_dumpall -h platform-db.ai-platform.svc.cluster.local -U "$PGUSER" \
+                    | gzip > "/backup/platform-db-${ts}.sql.gz"
+                  echo "dumped /backup/platform-db-${ts}.sql.gz"
+              env:
+                - name: PGUSER
+                  valueFrom: { secretKeyRef: { name: platform-db-credentials, key: username } }
+                - name: PGPASSWORD
+                  valueFrom: { secretKeyRef: { name: platform-db-credentials, key: password } }
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
+          # …then the aws-cli container uploads it to S3 and the emptyDir is discarded.
+          containers:
+            - name: upload
+              image: amazon/aws-cli:2.36.8
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  [ -n "${BACKUP_BUCKET:-}" ] || { echo "BACKUP_BUCKET not set — set it in the platform-db-backup-config ConfigMap"; exit 1; }
+                  aws s3 cp /backup/ "s3://${BACKUP_BUCKET}/platform-db/" --recursive --only-show-errors
+                  echo "uploaded to s3://${BACKUP_BUCKET}/platform-db/"
+              env:
+                - name: BACKUP_BUCKET
+                  valueFrom:
+                    configMapKeyRef:
+                      name: platform-db-backup-config
+                      key: bucket
+                      optional: true
+              volumeMounts:
+                - name: backup
+                  mountPath: /backup
+                  readOnly: true
+              securityContext:
+                allowPrivilegeEscalation: false
+                capabilities: { drop: ["ALL"] }
+          volumes:
+            - name: backup
+              emptyDir: {}

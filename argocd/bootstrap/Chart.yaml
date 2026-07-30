@@ -1,0 +1,9 @@
+apiVersion: v2
+name: ai-platform-bootstrap
+description: >-
+  App-of-apps for the AI platform. Renders the platform + workloads
+  ApplicationSets, injecting the git repo URL(s) from a single source
+  (Terraform var.gitops_repo_url, passed as Helm values by the root bootstrap
+  Application). This is the ONLY place a forker sets the repo URL.
+type: application
+version: 0.1.0

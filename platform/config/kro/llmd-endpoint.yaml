@@ -1,0 +1,363 @@
+# LLMDEndpoint — scale-tier serving via llm-d (KV-cache/load/prefix-aware routing).
+#
+# The high-throughput sibling of VLLMEndpoint. KRO renders the parts it owns well:
+#   - the vLLM model-server Deployment (N replicas, labeled for the InferencePool),
+#   - the LiteLLM registration Job (so the model answers through the same /v1 door),
+#   - an ArgoCD Application that installs the OFFICIAL llm-d router chart
+#     (llm-d-router-standalone) — which supplies the EPP + InferencePool + Envoy
+#     proxy. Delegating the router to the upstream chart keeps us upgrade-safe
+#     instead of freezing ~500 lines of chart output in this RGD.
+#
+# Request path: LiteLLM -> llm-d router (Envoy + EPP) -> InferencePool -> vLLM pod.
+# The EPP scores pods by queue depth, KV-cache utilization, and prefix reuse.
+#
+# MIGRATION: `minReplicas` now has `minimum=1` (scale-to-zero parked). Raising a
+# field's minimum (0 -> 1) is a breaking CRD change KRO refuses to apply in place
+# ("breaking changes detected: Minimum was increased from 0 to 1" -> the RGD goes
+# Inactive). Fresh installs are unaffected (the CRD is created with minimum=1). On
+# an EXISTING cluster that predates this, recreate the CRD once when no
+# LLMDEndpoints are live (safe, it holds no persistent state):
+#   kubectl delete crd llmdendpoints.kro.run   # KRO immediately rebuilds it
+#
+# Prereqs (shipped by default via the `inference-gateway` platform app — no
+# toggle): GIE CRDs installed + the ghcr.io/llm-d/charts OCI Helm repo registered
+# with ArgoCD. The router runs in standalone mode (its own Envoy+EPP per pool), so
+# no shared Envoy Gateway is needed. See platform/services/inference-gateway/.
+apiVersion: kro.run/v1alpha1
+kind: ResourceGraphDefinition
+metadata:
+  name: llmd-endpoint
+spec:
+  schema:
+    apiVersion: v1alpha1
+    kind: LLMDEndpoint
+    spec:
+      model:                "string"
+      gpuCount:             "integer | default=1"
+      tensorParallelSize:   "integer | default=0"
+      # DEPRECATED — superseded by minReplicas/maxReplicas; ignored by this RGD.
+      # Retained (not removed) to avoid a breaking CRD change (KRO refuses to
+      # drop schema properties in place).
+      replicas:             "integer | default=1 minimum=0"
+      minReplicas:          "integer | default=1 minimum=1"   # floor (>=1). Scale-to-zero (minReplicas 0) is PARKED: it needs llm-d image pre-baking + a LiteLLM cooldown/hold fix that aren't worth the ~2min cold-start floor yet. The arrival trigger in the ScaledObject below is the inert foundation for it.
+      maxReplicas:          "integer | default=3 minimum=1"   # ceiling; > minReplicas enables KEDA autoscaling
+      targetQueueDepth:     "integer | default=20"            # per-pod vllm:num_requests_waiting scale target
+      maxModelLen:          "integer | default=8192"
+      minVramPerGpuGiB:     "integer | default=0"
+      workerMemory:         "string  | default=16Gi"
+      workerCpu:            "string  | default=8"
+      vllmImage:            "string  | default=vllm/vllm-openai:v0.24.0"
+      # Optional tool/function calling (see VLLMEndpoint). When set, the vLLM
+      # server starts with --enable-auto-tool-choice --tool-call-parser <name>;
+      # `platformctl new-model` auto-fills it from the model architecture. Empty
+      # = chat-only. extraArgs appends any other raw vLLM flags.
+      toolCallParser:       "string"
+      extraArgs:            "[]string"
+      routerChartVersion:   "string  | default=v0.9.0"
+      # enum rejects typos at admission; without it a misspelled profile silently
+      # fell through the CEL scorer-weight ternaries to the 'balanced' weights.
+      routingProfile:       'string | default=balanced enum="balanced,prefix,throughput,latency"'   # -> EPP scorer weights
+    status:
+      ready:             "${vllmdeployment.status.?availableReplicas.orValue(0) > 0 ? 'True' : 'False'}"
+      availableReplicas: ${vllmdeployment.status.?availableReplicas.orValue(0)}
+      routerHealth:      "${routerapp.status.?health.?status.orValue('Unknown')}"
+
+  resources:
+    - id: platformConfig
+      externalRef:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: platform-config
+
+    - id: vllmdeployment
+      readyWhen:
+        - ${vllmdeployment.status.?availableReplicas.orValue(0) > 0}
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${schema.metadata.name}-llmd
+          labels:
+            app.kubernetes.io/name: ${schema.metadata.name}
+            ai-platform/serving-mode: llm-d
+        spec:
+          # NOTE: replicas is intentionally NOT set — the KEDA ScaledObject/HPA
+          # owns the replica count. Setting it here makes KRO reconcile it back
+          # and fight the autoscaler. Initial count comes from the ScaledObject's
+          # minReplicaCount once KEDA reconciles.
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: ${schema.metadata.name}
+              llm-d.ai/pool: ${schema.metadata.name}
+          template:
+            metadata:
+              labels:
+                app.kubernetes.io/name: ${schema.metadata.name}
+                llm-d.ai/pool: ${schema.metadata.name}
+                llm-d.ai/role: decode
+              annotations:
+                karpenter.sh/do-not-disrupt: "true"
+            spec:
+              serviceAccountName: inference-worker
+              nodeSelector:
+                workload-type: gpu-inference
+              tolerations:
+                - key: nvidia.com/gpu
+                  operator: Exists
+                  effect: NoSchedule
+              affinity:
+                nodeAffinity:
+                  requiredDuringSchedulingIgnoredDuringExecution:
+                    nodeSelectorTerms:
+                      - matchExpressions:
+                          - key: karpenter.k8s.aws/instance-gpu-memory
+                            operator: Gt
+                            values:
+                              - "${string(schema.spec.minVramPerGpuGiB > 0 ? ((schema.spec.minVramPerGpuGiB - 1) * 1024) - 1 : 0)}"
+              initContainers:
+                - name: hf-cache-download
+                  image: peakcom/s5cmd:v2.3.0
+                  env:
+                    - name: MODEL_ID
+                      value: ${schema.spec.model}
+                    - name: CACHE_BUCKET
+                      value: ${platformConfig.data.?modelCacheBucket.orValue("")}
+                    - name: AWS_REGION
+                      value: ${platformConfig.data.?region.orValue("us-east-1")}
+                  command:
+                    - sh
+                    - -c
+                    - |
+                      set -u
+                      if [ -z "$CACHE_BUCKET" ]; then
+                        echo "modelCacheBucket not configured — vLLM will download from HF."
+                        exit 0
+                      fi
+                      PREFIX="hf/$MODEL_ID"
+                      LOCAL="/hf-cache/hub/models--$(echo "$MODEL_ID" | sed 's#/#--#g')"
+                      if /s5cmd ls "s3://$CACHE_BUCKET/$PREFIX/" >/dev/null 2>&1; then
+                        echo "Cache hit — syncing to $LOCAL"
+                        mkdir -p "$LOCAL"
+                        /s5cmd sync "s3://$CACHE_BUCKET/$PREFIX/*" "$LOCAL/" || { echo "Partial sync — wiping"; rm -rf "$LOCAL"; }
+                      else
+                        echo "Cache miss for $MODEL_ID — vLLM will download from HF."
+                      fi
+                  volumeMounts:
+                    - name: hf-cache
+                      mountPath: /hf-cache
+              containers:
+                - name: modelserver
+                  image: ${platformConfig.data.?vllmImage.orValue(schema.spec.vllmImage)}
+                  command: ["vllm", "serve"]
+                  # Base flags + optional tool calling / extraArgs (see
+                  # VLLMEndpoint). Built as one CEL list so the optional parts
+                  # append cleanly; empty fields add nothing.
+                  args: >-
+                    ${[schema.spec.model,
+                       "--served-model-name", schema.spec.model,
+                       "--tensor-parallel-size", string(schema.spec.tensorParallelSize > 0 ? schema.spec.tensorParallelSize : schema.spec.gpuCount),
+                       "--max-model-len", string(schema.spec.maxModelLen),
+                       "--gpu-memory-utilization", "0.9",
+                       "--port", "8000",
+                       "--disable-access-log-for-endpoints=/health,/metrics,/v1/models"]
+                    + (schema.spec.?toolCallParser.orValue("") != "" ? ["--enable-auto-tool-choice", "--tool-call-parser", schema.spec.?toolCallParser.orValue("")] : [])
+                    + schema.spec.?extraArgs.orValue([])}
+                  env:
+                    - name: HF_TOKEN
+                      valueFrom:
+                        secretKeyRef:
+                          name: hf-token
+                          key: token
+                          optional: true
+                    - name: HF_HOME
+                      value: /hf-cache
+                    - name: HF_HUB_ENABLE_HF_TRANSFER
+                      value: "1"
+                  ports:
+                    - name: modelserver
+                      containerPort: 8000
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8000
+                    initialDelaySeconds: 30
+                    periodSeconds: 15
+                    failureThreshold: 80
+                  resources:
+                    requests:
+                      cpu: ${schema.spec.workerCpu}
+                      memory: ${schema.spec.workerMemory}
+                      nvidia.com/gpu: ${schema.spec.gpuCount}
+                    limits:
+                      cpu: ${schema.spec.workerCpu}
+                      memory: ${schema.spec.workerMemory}
+                      nvidia.com/gpu: ${schema.spec.gpuCount}
+                  volumeMounts:
+                    - name: hf-cache
+                      mountPath: /hf-cache
+                    - name: shm
+                      mountPath: /dev/shm
+              volumes:
+                - name: hf-cache
+                  emptyDir:
+                    sizeLimit: 100Gi
+                - name: shm
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 8Gi
+
+    # --- KEDA autoscaler (always rendered; KEDA owns the replica count) ---
+    # min==max pins a fixed size; max>minReplicas autoscales on vLLM saturation
+    # (per-pod queue depth from the autoscaling Prometheus). Scale-up responsive,
+    # scale-down conservative (GPU pods are slow to start). Requires the
+    # autoscaling capability (KEDA); if absent the Deployment stays at the K8s
+    # default until KEDA is installed.
+    - id: scaledobject
+      template:
+        apiVersion: keda.sh/v1alpha1
+        kind: ScaledObject
+        metadata:
+          name: ${schema.metadata.name}-llmd
+          namespace: ${schema.metadata.namespace}
+        spec:
+          scaleTargetRef:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: ${schema.metadata.name}-llmd
+          minReplicaCount: ${schema.spec.minReplicas}
+          maxReplicaCount: ${schema.spec.maxReplicas}
+          advanced:
+            horizontalPodAutoscalerConfig:
+              behavior:
+                scaleUp:
+                  stabilizationWindowSeconds: 30
+                  policies:
+                    - type: Pods
+                      value: 2
+                      periodSeconds: 60
+                scaleDown:
+                  stabilizationWindowSeconds: 300
+                  policies:
+                    - type: Pods
+                      value: 1
+                      periodSeconds: 120
+          triggers:
+            # Right-sizing above zero: scale on the real vLLM queue depth. This
+            # cannot wake a zero'd pool (no vLLM pod means no metric), so it is
+            # paired with the arrival trigger below for scale-from-zero.
+            - type: prometheus
+              metricType: AverageValue
+              metadata:
+                serverAddress: http://autoscaling-prometheus.inference.svc.cluster.local:9090
+                query: |-
+                  sum(max_over_time(vllm:num_requests_waiting{pool="${schema.metadata.name}"}[1m])) or vector(0)
+                threshold: "${string(schema.spec.targetQueueDepth)}"
+                activationThreshold: "1"
+            # Wake-from-zero (PARKED — inert while minReplicas >= 1 is enforced
+            # by the schema; kept as the validated foundation for when scale-to-
+            # zero is unparked). LiteLLM (the always-on front door) counts every
+            # request for this model BEFORE it reaches the EPP — including a
+            # request that arrives while the pool is scaled to zero (the EPP
+            # 503s before it would count anything). activationThreshold "0"
+            # means any request flips the pool 0->1; the high threshold keeps
+            # this trigger from driving scale beyond 1 (the queue-depth trigger
+            # above owns right-sizing once the pool is warm).
+            - type: prometheus
+              metricType: AverageValue
+              metadata:
+                serverAddress: http://autoscaling-prometheus.inference.svc.cluster.local:9090
+                query: |-
+                  sum(rate(litellm_proxy_total_requests_metric_total{requested_model="${schema.metadata.name}"}[1m])) or vector(0)
+                threshold: "1000"
+                activationThreshold: "0"
+
+    - id: routerapp
+      readyWhen:
+        - ${routerapp.status.?health.?status.orValue('') == "Healthy"}
+      template:
+        apiVersion: argoproj.io/v1alpha1
+        kind: Application
+        metadata:
+          name: ${schema.metadata.name}-llmd-router
+          namespace: argocd
+          finalizers:
+            - resources-finalizer.argocd.argoproj.io
+        spec:
+          project: default
+          source:
+            repoURL: ghcr.io/llm-d/charts
+            chart: llm-d-router-standalone
+            targetRevision: ${schema.spec.routerChartVersion}
+            helm:
+              releaseName: ${schema.metadata.name}
+              valuesObject:
+                router:
+                  epp:
+                    replicas: 1
+                    flags:
+                      v: 2
+                    pluginsConfigFile: "optimized-baseline-plugins.yaml"
+                    pluginsCustomConfig:
+                      optimized-baseline-plugins.yaml: |
+                        apiVersion: llm-d.ai/v1alpha1
+                        kind: EndpointPickerConfig
+                        plugins:
+                        - type: queue-scorer
+                        - type: kv-cache-utilization-scorer
+                        - type: prefix-cache-scorer
+                        - type: no-hit-lru-scorer
+                        schedulingProfiles:
+                        - name: default
+                          plugins:
+                          - pluginRef: queue-scorer
+                            weight: ${string(schema.spec.routingProfile == 'throughput' ? 3 : (schema.spec.routingProfile == 'latency' ? 4 : (schema.spec.routingProfile == 'prefix' ? 1 : 2)))}
+                          - pluginRef: kv-cache-utilization-scorer
+                            weight: ${string(schema.spec.routingProfile == 'latency' ? 1 : (schema.spec.routingProfile == 'balanced' ? 2 : 3))}
+                          - pluginRef: prefix-cache-scorer
+                            weight: ${string(schema.spec.routingProfile == 'prefix' ? 4 : (schema.spec.routingProfile == 'throughput' ? 1 : (schema.spec.routingProfile == 'latency' ? 2 : 3)))}
+                          - pluginRef: no-hit-lru-scorer
+                            weight: ${string((schema.spec.routingProfile == 'prefix' || schema.spec.routingProfile == 'latency') ? 1 : 2)}
+                    resources:
+                      requests:
+                        cpu: "1"
+                        memory: 2Gi
+                      limits:
+                        memory: 4Gi
+                  inferencePool:
+                    failureMode: "FailOpen"
+                  modelServers:
+                    protocol: http
+                    matchLabels:
+                      llm-d.ai/pool: ${schema.metadata.name}
+                  extraServicePorts:
+                    - name: http
+                      port: 80
+                      protocol: TCP
+                      targetPort: 8081
+                  proxy:
+                    args:
+                      - "--service-node"
+                      - "envoy-sidecar"
+                      - "--log-level"
+                      - "warn"
+                      - "--concurrency"
+                      - "4"
+                      - "-c"
+                      - "/etc/envoy/envoy.yaml"
+                    resources:
+                      requests:
+                        cpu: "1"
+                        memory: 2Gi
+                      limits:
+                        memory: 4Gi
+          destination:
+            name: local-cluster
+            namespace: ${schema.metadata.namespace}
+          syncPolicy:
+            automated:
+              prune: true
+              selfHeal: true
+            syncOptions:
+              - CreateNamespace=true
+              - ServerSideApply=true

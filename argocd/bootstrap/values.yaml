@@ -1,0 +1,19 @@
+# Bootstrap chart values.
+#
+# The REAL values are injected by Terraform into the root `bootstrap`
+# Application's spec.source.helm.valuesObject, sourced from ONE place —
+# your tfvars:
+#   repoURL          <- var.gitops_repo_url
+#   revision         <- var.gitops_revision
+#   workloadsRepoURL <- var.gitops_workloads_repo_url   (empty -> defaults to repoURL)
+#
+# The values below are only a fallback for `helm template argocd/bootstrap`
+# runs without values. Do NOT treat this file as the fork configuration point —
+# set the repo URL in tfvars; Terraform threads it to every ApplicationSet.
+repoURL: https://github.com/YOUR-ORG/YOUR-REPO.git
+revision: main
+# Where the self-service workloads live (models/, teams/, scale-models/). Empty
+# = same repo as the platform (repoURL). Point this at a separate, tenant-owned
+# workloads repo for multi-team self-service (teams get write to that repo only,
+# never to the platform repo). See workloads/README.md.
+workloadsRepoURL: ""

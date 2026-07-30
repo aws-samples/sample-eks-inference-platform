@@ -1,0 +1,118 @@
+# litellm-sync controller.
+#
+# Long-running pod that watches the three serving-tier CRs cluster-wide
+# (VLLMEndpoint / LLMDEndpoint / LLMDDisaggEndpoint) and is the sole owner of
+# LiteLLM's model registry — registering a model on create and deregistering it
+# on delete via a finalizer (see scripts/litellm_sync.py). This keeps the LiteLLM
+# master key out of workload namespaces (models can live in per-team namespaces).
+# Single
+# replica — recovery is automatic (the watch re-lists current state on
+# reconnect and the reconcile loop repairs any drift).
+#
+# Image strategy: python:3.12-slim base + initContainer that pip-installs the
+# kubernetes client into an emptyDir shared with the main container. No custom
+# image to build/push, matching the platform-health-agent event-watcher.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm-sync
+  namespace: inference
+  labels:
+    app.kubernetes.io/name: litellm-sync
+    app.kubernetes.io/part-of: ai-platform
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate                      # single-writer to the finalizer; no rolling
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: litellm-sync
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: litellm-sync
+        app.kubernetes.io/part-of: ai-platform
+    spec:
+      serviceAccountName: litellm-sync
+      automountServiceAccountToken: true
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      initContainers:
+        - name: install-pydeps
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              pip install --no-cache-dir --target=/pydeps \
+                  kubernetes==31.0.0
+          volumeMounts:
+            - name: pydeps
+              mountPath: /pydeps
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+      containers:
+        - name: sync
+          image: python:3.12-slim
+          command: ["python3", "/scripts/litellm_sync.py"]
+          env:
+            - name: PYTHONPATH
+              value: /pydeps
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: LITELLM_BASE_URL
+              value: http://litellm.ai-platform.svc.cluster.local:4000
+            - name: FINALIZER
+              value: litellm.ai-platform/deregister
+            - name: RECONCILE_INTERVAL_SEC
+              value: "600"
+            # Master key for the LiteLLM admin API — the Terraform-managed
+            # inference/litellm-api-key secret. Stays in this namespace only.
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: litellm-api-key
+                  key: master-key
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: pydeps
+              mountPath: /pydeps
+              readOnly: true
+          livenessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /, port: 8080 }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          ports:
+            - name: health
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: scripts
+          configMap:
+            name: litellm-sync-scripts
+            defaultMode: 0755
+        - name: pydeps
+          emptyDir: {}

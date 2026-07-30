@@ -1,0 +1,94 @@
+# Opt-in decode NodePool for the disaggregated (LLMDDisaggEndpoint) tier.
+# Decode is MEMORY-BANDWIDTH-bound (steady token generation; HBM bandwidth drives
+# tok/s) and cost-sensitive (it's the majority of the fleet). This pool favors
+# high-bandwidth-per-$ families (L40S, A10G) plus the big HBM parts for large
+# models, and deliberately EXCLUDES L4 (g6, ~0.30 TB/s) whose low bandwidth makes
+# it a poor decode GPU. Opt in with `decodeNodePool: gpu-decode`; default is the
+# shared `gpu-inference` pool. NOTE (fp8): a heterogeneous prefill/decode pair
+# must share a KV dtype — A10G (Ampere) has no fp8, so for fp8 KV keep decode on
+# L40S/Hopper. Most models use bf16 KV (works on all Ampere+), so the mix is safe.
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu-decode
+spec:
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  metadataOptions:
+    httpPutResponseHopLimit: 2
+    httpTokens: required
+    httpEndpoint: enabled
+  role: ${role}
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Name: ${cluster_name}-private-*
+        Environment: ${environment}
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: ${cluster_name}
+        Environment: ${environment}
+  blockDeviceMappings:
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: ${gpu_volume_size}Gi
+        volumeType: gp3
+        encrypted: true
+        throughput: 500
+        iops: 6000
+        ${gpu_snapshot_id_line}
+  userData: |
+    [settings.container-runtime]
+    snapshotter = "soci"
+    # Match gpu-inference: bare SOCI snapshotter (no parallel-pull-unpack) to
+    # match the baked EBS data-volume snapshot's content store.
+  tags:
+    karpenter.sh/discovery: ${cluster_name}
+    Environment: ${environment}
+    workload-type: gpu-decode
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu-decode
+spec:
+  weight: 50
+  template:
+    metadata:
+      labels:
+        workload-type: gpu-decode
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: gpu-decode
+      taints:
+        - key: nvidia.com/gpu
+          effect: NoSchedule
+      requirements:
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+        - key: karpenter.k8s.aws/instance-gpu-manufacturer
+          operator: In
+          values: ["nvidia"]
+        # High-bandwidth-per-$ families. Excludes L4 (g6, low HBM bandwidth) and
+        # A100-40 (p4d); keeps L40S (g6e), A10G (g5), A100-80 (p4de), H100/H200
+        # (p5/p5e/p5en). Karpenter cheapest-fits to the pod's gpuCount/VRAM.
+        - key: karpenter.k8s.aws/instance-family
+          operator: In
+          values: ["g6e", "g5", "p4de", "p5", "p5e", "p5en"]
+  limits:
+    nvidia.com/gpu: "16"
+  disruption:
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 300s
+    budgets:
+      - nodes: "1"

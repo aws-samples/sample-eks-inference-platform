@@ -1,0 +1,198 @@
+# Langfuse Helm Values — LLM Observability & Tracing
+# Chart: langfuse/langfuse v1.5.20
+# Repository: https://langfuse.github.io/langfuse-k8s
+#
+# Uses shared platform-db PostgreSQL, bundled ClickHouse, Redis, and MinIO.
+# Secrets are created by Terraform (langfuse-secrets, platform-db-credentials)
+# and referenced here via secretKeyRef — no secrets stored in git.
+
+langfuse:
+  # --- Tracing on first boot (turnkey) ---
+  # The langfuse-init Secret (Terraform-generated, ai-platform ns) carries the
+  # headless-initialization env vars (LANGFUSE_INIT_ORG/PROJECT/USER + project
+  # keys) plus NEXTAUTH_URL. On first boot Langfuse creates the org, project,
+  # API keys, and admin user — and LiteLLM is handed the SAME keys
+  # (langfuse-litellm-keys), so the very first model call is traced with no UI
+  # clicks. See terraform/30.eks/30.cluster/langfuse-init.tf.
+  #
+  # The LANGFUSE_INIT_* keys drive headless initialization (org/project/API
+  # keys/admin user on first boot). This chart (1.5.20) has NO `additionalEnvFrom`
+  # support — it only honors `additionalEnv` (a list) — so each key is pulled
+  # individually from the langfuse-init Secret via secretKeyRef. We deliberately
+  # do NOT include NEXTAUTH_URL here: the chart already emits it from
+  # `nextauth.url` (below), and a second entry would make ServerSideApply reject
+  # the sync ("duplicate entries for key NEXTAUTH_URL"). `nextauth.url` is the
+  # single source of truth for the browser-facing URL.
+  additionalEnv:
+    - name: LANGFUSE_INIT_ORG_ID
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_ORG_ID } }
+    - name: LANGFUSE_INIT_ORG_NAME
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_ORG_NAME } }
+    - name: LANGFUSE_INIT_PROJECT_ID
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_PROJECT_ID } }
+    - name: LANGFUSE_INIT_PROJECT_NAME
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_PROJECT_NAME } }
+    - name: LANGFUSE_INIT_PROJECT_PUBLIC_KEY
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_PROJECT_PUBLIC_KEY } }
+    - name: LANGFUSE_INIT_PROJECT_SECRET_KEY
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_PROJECT_SECRET_KEY } }
+    - name: LANGFUSE_INIT_USER_EMAIL
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_USER_EMAIL } }
+    - name: LANGFUSE_INIT_USER_NAME
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_USER_NAME } }
+    - name: LANGFUSE_INIT_USER_PASSWORD
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_USER_PASSWORD } }
+    # --- SSO (Cognito OIDC) ---
+    # Optional refs: until Terraform (enable_sso) creates `sso-secrets`, the
+    # custom provider stays disabled and the email/password (break-glass) admin
+    # login still works. ALLOW_ACCOUNT_LINKING merges the SSO identity into the
+    # existing seed admin when the email matches.
+    - name: AUTH_CUSTOM_NAME
+      value: "SSO"
+    - name: AUTH_CUSTOM_SCOPE
+      value: "openid email profile"
+    - name: AUTH_CUSTOM_ALLOW_ACCOUNT_LINKING
+      value: "true"
+    - name: AUTH_CUSTOM_CLIENT_ID
+      valueFrom: { secretKeyRef: { name: sso-secrets, key: langfuse-client-id, optional: true } }
+    - name: AUTH_CUSTOM_CLIENT_SECRET
+      valueFrom: { secretKeyRef: { name: sso-secrets, key: langfuse-client-secret, optional: true } }
+    - name: AUTH_CUSTOM_ISSUER
+      valueFrom: { secretKeyRef: { name: sso-secrets, key: issuer, optional: true } }
+    # Auto-provision SSO users into the platform org with a baseline role.
+    # OSS Langfuse supports only ONE default role (no per-group mapping — that
+    # needs Enterprise/SCIM); the break-glass init admin remains OWNER.
+    - name: LANGFUSE_DEFAULT_ORG_ID
+      valueFrom: { secretKeyRef: { name: langfuse-init, key: LANGFUSE_INIT_ORG_ID } }
+    - name: LANGFUSE_DEFAULT_ORG_ROLE
+      value: "MEMBER"
+
+  salt:
+    secretKeyRef:
+      name: langfuse-secrets
+      key: salt
+
+  nextauth:
+    # Browser-facing URL — NextAuth validates the sign-in Host header against it,
+    # so it must match what users type. This `url` is only the INITIAL value the
+    # chart renders into langfuse-web; the live value is reconciled at runtime:
+    #
+    #   - Default (ALB, turnkey): the langfuse-nextauth-url CronJob
+    #     (platform/config/langfuse-nextauth-url.yaml) reads the ALB hostname off
+    #     the ingress and sets NEXTAUTH_URL=http://<alb-host>:3000 on the
+    #     Deployment, so UI sign-in works behind the load balancer with zero
+    #     manual steps. ArgoCD selfHeal is told to ignore that env value
+    #     (ignoreDifferences in argocd/bootstrap/platform.yaml) so it sticks.
+    #
+    #   - Custom domain (production): pin a real URL here, e.g.
+    #     https://langfuse.example.com (behind Route53 + ACM). The reconciler
+    #     detects the non-placeholder value and leaves it alone.
+    #
+    #   - SSM tunnel fallback: the localhost default below still works via
+    #     ./platformctl tunnel on a cluster with no ALB ingress.
+    url: "http://localhost:3000"
+    secret:
+      secretKeyRef:
+        name: langfuse-secrets
+        key: nextauth-secret
+
+  encryptionKey:
+    secretKeyRef:
+      name: langfuse-secrets
+      key: encryption-key
+
+  service:
+    type: ClusterIP
+    port: 3000
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  ingress:
+    enabled: false
+
+# External PostgreSQL — shared platform-db (managed in platform/services/litellm/).
+# Chart uses postgresql.* for DB config, not a separate database section.
+# postgresql.auth.existingSecret + secretKeys for password from K8s secret.
+postgresql:
+  deploy: false
+  host: platform-db.ai-platform.svc.cluster.local
+  port: 5432
+  auth:
+    username: platform
+    database: langfuse
+    existingSecret: platform-db-credentials
+    secretKeys:
+      userPasswordKey: password
+
+# ClickHouse for analytics/event ingestion (also stores trace events)
+clickhouse:
+  deploy: true
+  replicaCount: 1
+  auth:
+    existingSecret: langfuse-secrets
+    existingSecretKey: clickhouse-password
+  # Cap ClickHouse's OWN internal profiling tables (system.trace_log,
+  # *_metric_log, etc.) with a 3-day TTL. These are unrelated to Langfuse
+  # traces; left uncapped, system.trace_log alone grew to ~47 GiB and filled
+  # the 50Gi PVC, which silently blocked Langfuse trace ingestion (every
+  # ClickHouse insert failed with "not enough space"). The <engine> override
+  # applies at table creation; existing clusters also need a one-time
+  # `ALTER TABLE system.trace_log MODIFY TTL event_date + INTERVAL 3 DAY`.
+  extraOverrides: |
+    <clickhouse>
+      <trace_log replace="1"><engine>ENGINE = MergeTree PARTITION BY toYYYYMM(event_date) ORDER BY (event_date, event_time) TTL event_date + INTERVAL 3 DAY DELETE SETTINGS ttl_only_drop_parts=1</engine></trace_log>
+      <metric_log replace="1"><engine>ENGINE = MergeTree PARTITION BY toYYYYMM(event_date) ORDER BY (event_date, event_time) TTL event_date + INTERVAL 3 DAY DELETE SETTINGS ttl_only_drop_parts=1</engine></metric_log>
+      <asynchronous_metric_log replace="1"><engine>ENGINE = MergeTree PARTITION BY toYYYYMM(event_date) ORDER BY (event_date, event_time) TTL event_date + INTERVAL 3 DAY DELETE SETTINGS ttl_only_drop_parts=1</engine></asynchronous_metric_log>
+    </clickhouse>
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: gp3
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+  zookeeper:
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+
+# Redis for caching and queue management
+redis:
+  deploy: true
+  auth:
+    existingSecret: langfuse-secrets
+    existingSecretPasswordKey: redis-password
+  primary:
+    persistence:
+      enabled: true
+      size: 8Gi
+      storageClass: gp3
+
+# MinIO (bundled S3-compatible blob storage for traces/events)
+s3:
+  deploy: true
+  accessKeyId:
+    value: "minio"
+  secretAccessKey:
+    secretKeyRef:
+      name: langfuse-secrets
+      key: s3-secret-key
+  auth:
+    rootUser: "minio"
+    existingSecret: langfuse-secrets
+    rootPasswordSecretKey: s3-secret-key
+    rootUserSecretKey: ""

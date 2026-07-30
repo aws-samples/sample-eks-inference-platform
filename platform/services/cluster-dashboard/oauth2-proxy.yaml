@@ -1,0 +1,118 @@
+# oauth2-proxy — SSO gate for the cluster dashboard (which has no native auth).
+#
+# The dashboard Ingress (manifests.yaml) routes to this proxy instead of directly
+# to the dashboard; oauth2-proxy authenticates the user against Cognito and only
+# forwards requests from members of the allowed groups (platform admins +
+# developers), then proxies to the dashboard as its upstream.
+#
+# CONFIG comes from `oauth2-proxy-secrets`, created by Terraform when enable_sso
+# is set (default on). ORDERING: on a FRESH cluster Terraform creates that Secret
+# before ArgoCD syncs, so this starts cleanly and the dashboard is protected out
+# of the box. On an EXISTING cluster you MUST run `terraform apply` (enable_sso)
+# to create the Secret BEFORE this is synced — otherwise oauth2-proxy has no
+# OIDC config and the dashboard is unreachable until it does.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: ai-platform
+  labels:
+    app: oauth2-proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.3
+          args:
+            - --http-address=0.0.0.0:4180
+            - --provider=oidc
+            - --skip-provider-button=true
+            - --email-domain=*
+            - --scope=openid email profile
+            - --oidc-groups-claim=cognito:groups
+            - --allowed-group=ai-platform-admins
+            - --allowed-group=ai-platform-developers
+            - --upstream=http://cluster-dashboard.ai-platform.svc.cluster.local:9090
+            - --reverse-proxy=true
+            # Forward the verified identity to the dashboard. --pass-authorization-header
+            # injects `Authorization: Bearer <OIDC id_token>` into the request
+            # forwarded to the upstream (cluster-dashboard), which the backend
+            # cryptographically verifies before allowing any mutation (approve /
+            # dismiss / delete) — so authorization does not depend on network path
+            # (the tunnel bypasses this proxy). NOTE: --set-authorization-header is
+            # a DIFFERENT flag — it sets the header on oauth2-proxy's own response,
+            # for the Nginx auth_request pattern; it does nothing for the upstream
+            # request in --reverse-proxy mode, which is what this dashboard needs.
+            # --set-xauthrequest adds X-Auth-Request-Email/-Groups for audit/read
+            # context (not used for authorization).
+            - --pass-authorization-header=true
+            - --set-xauthrequest=true
+            # HTTP today (tunnel/ALB). Set --cookie-secure=true once fronted by
+            # CloudFront/HTTPS.
+            - --cookie-secure=false
+          env:
+            - name: OAUTH2_PROXY_OIDC_ISSUER_URL
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secrets
+                  key: issuer
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secrets
+                  key: client-id
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secrets
+                  key: client-secret
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secrets
+                  key: cookie-secret
+            - name: OAUTH2_PROXY_REDIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: oauth2-proxy-secrets
+                  key: redirect-url
+          ports:
+            - containerPort: 4180
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: 4180
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy
+  namespace: ai-platform
+  labels:
+    app: oauth2-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app: oauth2-proxy
+  ports:
+    - port: 4180
+      targetPort: 4180
+      name: http
