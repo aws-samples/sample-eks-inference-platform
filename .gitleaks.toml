@@ -1,0 +1,15 @@
+# Gitleaks configuration — extends the default ruleset.
+# https://github.com/gitleaks/gitleaks#configuration
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives"
+regexTarget = "line"
+regexes = [
+  # terraform/30.eks/30.cluster/capabilities.tf — the for_each list of secret
+  # NAMES passed to `random_password` (values are generated at deploy time and
+  # never appear in code). The default hashicorp-tf-password rule matches the
+  # quoted "...-password" strings in the list.
+  '''"password", "clickhouse-password", "redis-password", "s3-secret-key"''',
+]
