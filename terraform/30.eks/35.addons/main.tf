@@ -2,6 +2,20 @@ data "aws_region" "current" {}
 
 data "aws_caller_identity" "current" {}
 
+# AWS Load Balancer Controller v3.x IAM supplement. The blueprints module's
+# built-in LBC policy predates v3 and lacks ec2:DescribeRouteTables, which v3
+# calls during subnet discovery (read-only; scoping mirrors the module's other
+# ec2:Describe* statements). Diffed against the upstream v3.4.3
+# docs/install/iam_policy.json — this is the only missing action.
+data "aws_iam_policy_document" "lbc_v3_supplement" {
+  statement {
+    sid       = "LBCv3DescribeRouteTables"
+    effect    = "Allow"
+    actions   = ["ec2:DescribeRouteTables"]
+    resources = ["*"]
+  }
+}
+
 module "eks_blueprints_addons" {
   source  = "aws-ia/eks-blueprints-addons/aws"
   version = "~> 1.21.0"
@@ -16,6 +30,18 @@ module "eks_blueprints_addons" {
   # common addons deployed with EKS Blueprints Addons
   enable_aws_load_balancer_controller = local.capabilities.loadbalancing
   aws_load_balancer_controller = {
+    # Pin the LB controller chart. Since LBC v3.0.0 the chart version aligns
+    # with the app version (v2.x used chart 1.x). The pinned blueprints module
+    # defaults to chart 1.7.1 (app v2.7.1), which is far behind upstream.
+    # NOTE for LIVE-cluster upgrades from v2.x: Helm does not upgrade CRDs —
+    # apply the latest CRDs first:
+    #   kubectl apply -k "github.com/aws/eks-charts/stable/aws-load-balancer-controller/crds?ref=master"
+    # Fresh installs (new forker clusters) get current CRDs automatically.
+    chart_version = "3.4.3"
+    # LBC v3 needs ec2:DescribeRouteTables (subnet discovery), which the
+    # pinned module's built-in policy predates. Merged in via the module's
+    # source_policy_documents passthrough.
+    source_policy_documents = [data.aws_iam_policy_document.lbc_v3_supplement.json]
     set = [
       {
         name  = "vpcId"
