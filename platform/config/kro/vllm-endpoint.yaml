@@ -46,6 +46,18 @@ spec:
       # (quantization, dtype, kv-cache, etc.). Advanced use — most models need
       # nothing here.
       extraArgs:            "[]string"
+      # Extra environment variables for the vLLM container (e.g. day-0 model
+      # kernels toggles like VLLM_ENABLE_K3_LATENT_MOE_TAIL_FUSION). Delivered
+      # via a per-endpoint ConfigMap + envFrom; explicit `env` entries (HF_TOKEN,
+      # HF_HOME, ...) take precedence over envFrom on key collision.
+      extraEnv:             "map[string]string"
+      # Scratch sizing. hfCacheSize bounds the emptyDir that stages the model
+      # weights (HF download or S3 cache sync) — must exceed the checkpoint
+      # size (e.g. ~1.5Ti for Kimi-K3 MXFP4; also raise the node volume via
+      # the gpu_node_volume_size_gib tfvar). shmSize is /dev/shm for
+      # tensor-parallel NCCL/CUDA IPC buffers.
+      hfCacheSize:          "string  | default=100Gi"
+      shmSize:              "string  | default=8Gi"
     status:
       ready:             "${vllmdeployment.status.?availableReplicas.orValue(0) > 0 ? 'True' : 'False'}"
       availableReplicas: ${vllmdeployment.status.?availableReplicas.orValue(0)}
@@ -58,6 +70,20 @@ spec:
         kind: ConfigMap
         metadata:
           name: platform-config
+
+    # Per-endpoint env ConfigMap — carries spec.extraEnv to the vLLM container
+    # via envFrom. Always created (empty data when extraEnv is unset) so the
+    # container spec never has to be conditional.
+    - id: vllmenv
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${schema.metadata.name}-vllm-env
+          labels:
+            app.kubernetes.io/name: ${schema.metadata.name}
+            ai-platform/serving-mode: vllm
+        data: ${schema.spec.?extraEnv.orValue({})}
 
     - id: vllmservice
       template:
@@ -178,6 +204,11 @@ spec:
                       value: /hf-cache
                     - name: HF_HUB_ENABLE_HF_TRANSFER
                       value: "1"
+                  # spec.extraEnv (may be empty). Explicit `env` above wins on
+                  # key collision (Kubernetes applies env after envFrom).
+                  envFrom:
+                    - configMapRef:
+                        name: ${vllmenv.metadata.name}
                   ports:
                     - name: http
                       containerPort: 8000
@@ -205,8 +236,8 @@ spec:
               volumes:
                 - name: hf-cache
                   emptyDir:
-                    sizeLimit: 100Gi
+                    sizeLimit: ${schema.spec.hfCacheSize}
                 - name: shm
                   emptyDir:
                     medium: Memory
-                    sizeLimit: 8Gi
+                    sizeLimit: ${schema.spec.shmSize}

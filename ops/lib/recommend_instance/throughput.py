@@ -43,6 +43,10 @@ DECODE_KERNEL_EFFICIENCY_BY_DTYPE = {
     "gptq4": 0.55,
     "awq4":  0.55,
     "nf4":   0.50,   # bitsandbytes 4-bit, slightly slower kernel
+    # MXFP4: Marlin-style dequant on Ampere/Hopper ≈ int4 kernels; on
+    # Blackwell it's native FP4 tensor-core (closer to fp8's MBU). Single
+    # table value keeps the model simple — 0.55 is the conservative floor.
+    "mxfp4": 0.55,
 }
 
 # Backwards-compat default (used if dtype not in table).

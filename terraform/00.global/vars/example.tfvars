@@ -97,6 +97,19 @@ gitops_revision = "main"
 # When empty (default), nodes fall back to SOCI lazy-loading or full image pull.
 # gpu_data_volume_snapshot_id = "snap-0123456789abcdef0"
 
+# EC2 Capacity Blocks / Capacity Reservations (optional) — frontier GPU capacity.
+# Instances like p6-b300.48xlarge (8x B300 — what trillion-param-class models such
+# as moonshotai/Kimi-K3 need) have no practical on-demand pool: reserve a Capacity
+# Block for ML in the EC2 console, then list the reservation ID(s) here. The
+# gpu-inference NodePool will prioritize the reserved capacity and fall back to
+# on-demand/spot for everything else. Leave unset for the default (no reservations).
+# gpu_capacity_reservation_ids = ["cr-0123456789abcdef0"]
+
+# GPU node data-volume size in GiB (optional). Default 0 = the baked image
+# snapshot size (200 GiB). Model weights are staged on this volume (hf-cache),
+# so raise it for very large models — Kimi-K3's ~1.5 TiB MXFP4 weights need >= 2000.
+# gpu_node_volume_size_gib = 2000
+
 # Platform Health Agent (optional) — autonomous incident investigation/remediation.
 # NOT a Terraform concern: it ships as a component of the cluster-dashboard
 # ArgoCD app (always deployed, ai-platform namespace) and idles until you create

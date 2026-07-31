@@ -475,6 +475,11 @@ def print_human(
                   f"{eff_bw:.2f} TB/s effective){C.RESET}")
         if best.quant_warning:
             print(f"    {C.YELLOW}⚠ Quant compatibility: {best.quant_warning}{C.RESET}")
+        if best.instance.needs_capacity_block:
+            print(f"    {C.YELLOW}⚠ Capacity Block required: {best.instance.name} has no "
+                  f"practical on-demand pool. Reserve one (EC2 console → Capacity "
+                  f"Blocks for ML), then set gpu_capacity_reservation_ids = "
+                  f'["cr-..."] in your tfvars and re-apply the cluster stage.{C.RESET}')
         if best.over_price_ceiling:
             print(f"    {C.YELLOW}Note: exceeds --max-price ${args.max_price:.2f}/hr. "
                   f"No cheaper option fits.{C.RESET}")
@@ -1084,6 +1089,14 @@ def build_endpoint_yaml(
         # replica count (not min/max). The llm-d tier is the scale path.
         lines.append(f"  # maxNumSeqs: {max_num_seqs}")
         lines.append(f"  replicas: {min_replicas}")
+        # The hf-cache emptyDir stages the full checkpoint (HF download or S3
+        # cache sync) — the RGD default is 100Gi, so oversize it explicitly for
+        # big models (weights + 15% for tokenizer/config/partial-download slack).
+        hf_cache_gib = math.ceil(vram.weights_gb * 1.15)
+        if hf_cache_gib > 100:
+            lines.append(f'  hfCacheSize: "{hf_cache_gib}Gi"  # model weights are '
+                         f'~{vram.weights_gb:,.0f} GiB — also ensure the node volume fits '
+                         f'(tfvar gpu_node_volume_size_gib)')
 
     # Tool/function calling applies to all three tiers (each fronts vLLM). Auto-
     # enable it for known tool-capable families so tool_choice:auto works out of

@@ -113,7 +113,11 @@ def fetch_model(model_id: str, token: str | None) -> ModelSpec:
 
     # MoE detection.
     num_experts    = int(cfg.get("num_local_experts") or cfg.get("num_experts") or 0)
-    active_experts = int(cfg.get("num_experts_per_tok") or cfg.get("moe_k") or 0)
+    # Active experts per token — key spelling varies by family: Mixtral/Qwen use
+    # `num_experts_per_tok`, DBRX `moe_k`, Kimi-K3 `num_experts_per_token`.
+    active_experts = int(cfg.get("num_experts_per_tok")
+                         or cfg.get("num_experts_per_token")
+                         or cfg.get("moe_k") or 0)
     is_moe         = num_experts > 1
 
     # 2. Parameter count — try HF's reported safetensors total first.

@@ -22,6 +22,12 @@ spec:
     - tags:
         karpenter.sh/discovery: ${cluster_name}
         Environment: ${environment}
+  # Capacity Blocks / ODCRs for frontier accelerators (p6-b300 etc.). Rendered
+  # by Terraform from gpu_capacity_reservation_ids — a complete
+  # capacityReservationSelectorTerms block when set, or a blank line when not
+  # (same pattern as the snapshotID line below). Karpenter prioritizes this
+  # reserved capacity before falling back to on-demand/spot.
+  ${gpu_capacity_reservation_selector}
   blockDeviceMappings:
     - deviceName: /dev/xvdb
       ebs:
@@ -77,9 +83,13 @@ spec:
         - key: kubernetes.io/os
           operator: In
           values: ["linux"]
+        # Rendered by Terraform: '"spot", "on-demand"' normally, with
+        # '"reserved"' prepended when gpu_capacity_reservation_ids is set
+        # ("reserved" is only valid when the NodeClass selects reservations).
+        # Karpenter always prefers reserved > spot/on-demand when eligible.
         - key: karpenter.sh/capacity-type
           operator: In
-          values: ["spot", "on-demand"]
+          values: [${gpu_capacity_types}]
         - key: karpenter.k8s.aws/instance-category
           operator: In
           values: ["g", "p"]

@@ -33,6 +33,10 @@ module "karpenter" {
   #   - iam:ListInstanceProfiles    → required since Karpenter 1.7 for the
   #     instance-profile controller/garbage-collection (does not support
   #     resource-level scoping, so it must target "*").
+  #   - ec2:DescribeCapacityReservations → required for
+  #     capacityReservationSelectorTerms (ODCR / Capacity Block discovery for
+  #     gpu_capacity_reservation_ids; ReservedCapacity gate is on by default
+  #     since Karpenter 1.6). Harmless when no reservations are configured.
   # All are read-only; consistent with the module's AllowRegionalReadActions.
   iam_policy_statements = [
     {
@@ -42,6 +46,7 @@ module "karpenter" {
       actions = [
         "ec2:DescribeInstanceStatus",
         "ec2:DescribePlacementGroups",
+        "ec2:DescribeCapacityReservations",
         "iam:ListInstanceProfiles",
       ]
     }
@@ -134,6 +139,34 @@ resource "helm_release" "karpenter" {
 # Karpenter default NodePool & NodeClass
 # Create NodePools for both self-managed Karpenter and EKS Auto Mode (managed Karpenter)
 ################################################################################
+
+locals {
+  # --- GPU capacity reservations (ODCRs / Capacity Blocks) -------------------
+  # Rendered as a complete YAML block for the gpu-inference EC2NodeClass when
+  # reservations are configured, or an empty string (→ blank line) when not —
+  # same pattern as gpu_snapshot_id_line. The placeholder sits at the NodeClass
+  # spec indent (2 spaces); continuation lines carry their own indent.
+  gpu_capacity_reservation_selector = length(var.gpu_capacity_reservation_ids) == 0 ? "" : join("\n", concat(
+    ["capacityReservationSelectorTerms:"],
+    [for id in var.gpu_capacity_reservation_ids : "    - id: ${id}"],
+  ))
+  # NodePool karpenter.sh/capacity-type values. "reserved" is only valid when
+  # the NodeClass actually selects reservations (Karpenter rejects it
+  # otherwise); when present, Karpenter prioritizes reserved capacity before
+  # falling back to on-demand/spot.
+  gpu_capacity_types = join(", ", [
+    for t in concat(
+      length(var.gpu_capacity_reservation_ids) > 0 ? ["reserved"] : [],
+      ["spot", "on-demand"],
+    ) : format("%q", t)
+  ])
+
+  # GPU data volume size — the baked image snapshot's size by default, or the
+  # operator override for very large models (weights land on this volume via
+  # the hf-cache emptyDir; Kimi-K3-class checkpoints need ~2 TiB).
+  gpu_node_volume_gib = var.gpu_node_volume_size_gib > 0 ? var.gpu_node_volume_size_gib : local.snapshot_volume_gib
+}
+
 data "kubectl_path_documents" "karpenter_manifests" {
   count   = (local.capabilities.autoscaling || local.eks_auto_mode) ? 1 : 0
   pattern = "${path.module}/karpenter/*.yaml"
@@ -146,8 +179,12 @@ data "kubectl_path_documents" "karpenter_manifests" {
     # Source: explicit tfvar override > auto-discovered snapshot > disabled.
     gpu_snapshot_id_line = local.resolved_snapshot_id != "" ? "snapshotID: ${local.resolved_snapshot_id}" : ""
     # GPU data volume size — must be >= the baked snapshot's volume size.
-    # Kept in sync with local.snapshot_volume_gib.
-    gpu_volume_size = local.snapshot_volume_gib
+    # Kept in sync with local.snapshot_volume_gib (overridable via
+    # gpu_node_volume_size_gib for very large models).
+    gpu_volume_size = local.gpu_node_volume_gib
+    # Capacity Blocks / ODCRs for GPU inference nodes (empty = disabled).
+    gpu_capacity_reservation_selector = local.gpu_capacity_reservation_selector
+    gpu_capacity_types                = local.gpu_capacity_types
   }
   depends_on = [
     module.eks
@@ -174,7 +211,11 @@ data "kubectl_path_documents" "karpenter_manifests_dummy" {
     cluster_name         = ""
     environment          = terraform.workspace
     gpu_snapshot_id_line = ""
-    gpu_volume_size      = local.snapshot_volume_gib
+    gpu_volume_size      = local.gpu_node_volume_gib
+    # Plan-time-known (pure function of tfvars) — same values as the real
+    # block, but they only need to keep the document COUNT stable.
+    gpu_capacity_reservation_selector = local.gpu_capacity_reservation_selector
+    gpu_capacity_types                = local.gpu_capacity_types
   }
 }
 

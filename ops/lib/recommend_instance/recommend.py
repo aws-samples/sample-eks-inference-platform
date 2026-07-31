@@ -299,6 +299,9 @@ def find_options(
                          + (" (NVLink)" if inst.has_nvlink else " (PCIe)"))
         if nodepool == "out-of-cluster":
             notes.append("not covered by Karpenter NodePools")
+        if inst.needs_capacity_block:
+            notes.append("procure via EC2 Capacity Block — set "
+                         "gpu_capacity_reservation_ids in tfvars")
         if over_ceiling:
             notes.append(f"${price:.2f}/hr exceeds --max-price ${max_price:.2f}")
 

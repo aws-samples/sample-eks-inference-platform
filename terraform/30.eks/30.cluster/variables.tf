@@ -106,6 +106,28 @@ variable "gpu_data_volume_snapshot_id" {
   default     = ""
 }
 
+variable "gpu_capacity_reservation_ids" {
+  description = "EC2 Capacity Reservation IDs (ODCRs or Capacity Blocks, e.g. cr-0123456789abcdef0) that GPU inference nodes may consume. Required for frontier accelerators with no practical on-demand pool (p6-b300 for Kimi-K3-class models) — create a Capacity Block for ML in the EC2 console, then list its reservation ID here. Karpenter (ReservedCapacity is on by default since v1.6) prioritizes this reserved capacity before falling back to on-demand/spot. Empty (default) = no reservations; the gpu-inference NodePool behaves exactly as before."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.gpu_capacity_reservation_ids : can(regex("^cr-[0-9a-f]+$", id))])
+    error_message = "Each entry must be an EC2 capacity reservation ID (cr-xxxxxxxxxxxxxxxxx)."
+  }
+}
+
+variable "gpu_node_volume_size_gib" {
+  description = "Size (GiB) of the GPU nodes' Bottlerocket data volume (images + HuggingFace weight cache). 0 (default) = use the baked image-snapshot size (200 GiB). Raise for very large models — e.g. Kimi-K3's ~1.5 TiB MXFP4 weights need >= 2000. Must be >= the baked snapshot size; Bottlerocket grows the filesystem on boot."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.gpu_node_volume_size_gib == 0 || var.gpu_node_volume_size_gib >= 200
+    error_message = "gpu_node_volume_size_gib must be 0 (auto) or >= 200 (the baked snapshot volume size)."
+  }
+}
+
 variable "enable_sso" {
   description = "Ship a Cognito-backed SSO identity plane for the platform UIs (Open WebUI, LiteLLM UI, Langfuse) and per-user cost attribution. When true (and gitops is enabled), Terraform creates a Cognito user pool, hosted-UI domain, groups (admins/developers/users), three seed users (passwords surfaced as outputs), and app clients. SSO works out of the box via `platformctl tunnel` (localhost callbacks); set sso_public_urls once a public HTTPS front (CloudFront) is deployed. Optionally federate an enterprise IdP into the pool. Identity Center remains required only for ArgoCD SSO."
   type        = bool

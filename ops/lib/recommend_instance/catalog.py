@@ -24,6 +24,12 @@ WEIGHT_BYTES = {
     "gptq4": 0.5,
     "awq4":  0.5,
     "nf4":   0.5,
+    # Microscaling FP4 (OCP MX spec) — the native distribution format of
+    # frontier open-weight checkpoints like gpt-oss and Kimi-K3. 4-bit
+    # elements + per-32-element FP8 scale ⇒ ~0.56 B/param effective; we keep
+    # 0.5 for consistency with the other 4-bit labels (the 15% overhead pad
+    # in estimate_vram absorbs the scale factors).
+    "mxfp4": 0.5,
 }
 
 # Bytes per element for KV cache.
@@ -78,6 +84,11 @@ class Instance:
     hbm_bandwidth_tb_s:  float = 0.0    # per-GPU HBM bandwidth (TB/s) — drives decode tok/s
     compute_capability:  str   = ""     # NVIDIA CUDA compute capability ("7.5", "8.0", ...)
     arch_family:         str   = ""     # "Turing" | "Ampere" | "Ada" | "Hopper" | "Blackwell"
+    # True for instance types that are practically procured via EC2 Capacity
+    # Blocks (frontier accelerators with little/no on-demand pool). Surfaces a
+    # note in the recommendation; requires gpu_capacity_reservation_ids in
+    # tfvars so the gpu-inference NodePool can target the reservation.
+    needs_capacity_block: bool = False
 
     @property
     def family(self) -> str:
@@ -111,6 +122,7 @@ class Instance:
 #   A100-80 2039 GB/s (Ampere, cc 8.0, bf16 + int4 OK; no fp8)
 #   H100  3350 GB/s (Hopper,  cc 9.0,  fp8 + bf16 + int4 OK)
 #   H200  4800 GB/s (Hopper,  cc 9.0,  fp8 + bf16 + int4 OK)
+#   B300  8000 GB/s (Blackwell Ultra, cc 10.0, native fp4/mxfp4 + fp8 + bf16)
 INSTANCES: list[Instance] = [
     # g4dn — T4 (no NVLink, Turing — limited dtype support)
     Instance("g4dn.xlarge",   "T4",         1, 16,   4,  16,  0.526,
@@ -169,6 +181,17 @@ INSTANCES: list[Instance] = [
              hbm_bandwidth_tb_s=4.80, compute_capability="9.0", arch_family="Hopper"),
     Instance("p5en.48xlarge", "H200 141GB", 8, 141, 192, 2048, 124.000, has_nvlink=True,
              hbm_bandwidth_tb_s=4.80, compute_capability="9.0", arch_family="Hopper"),
+
+    # p6-b300 — B300 Blackwell Ultra (NVLink; native fp4/mxfp4 tensor cores).
+    # EC2 reports 275,040 MiB/GPU (= 288 GB marketing ≈ 268 GiB); vram_gb uses
+    # the binary figure because estimate_vram computes needs in GiB (1024³).
+    # 2.1 TiB aggregate — the single-node home for trillion-param-class MoE
+    # checkpoints (e.g. Kimi-K3 at mxfp4). Practically procured via EC2
+    # Capacity Blocks: set gpu_capacity_reservation_ids in tfvars so the
+    # gpu-reserved NodePool can target the reservation.
+    Instance("p6-b300.48xlarge", "B300 288GB", 8, 268, 192, 4096, 142.416,
+             has_nvlink=True, hbm_bandwidth_tb_s=8.00, compute_capability="10.0",
+             arch_family="Blackwell", needs_capacity_block=True),
 ]
 
 
@@ -189,6 +212,10 @@ QUANT_MIN_COMPUTE_CAPABILITY = {
     "gptq4": "8.0",   # same as int4
     "awq4":  "8.0",   # same as int4
     "nf4":   "8.0",   # bitsandbytes 4-bit
+    # MXFP4 runs on Ampere/Hopper via Marlin-style dequant kernels (vLLM's
+    # gpt_oss_mxfp4 path requires cc >= 8.0); Blackwell (cc 10.0) executes it
+    # natively on FP4 tensor cores.
+    "mxfp4": "8.0",
 }
 
 # Same table for KV cache dtypes.
