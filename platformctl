@@ -172,15 +172,32 @@ purge_env_definition() {
 _predown_delete_albs() {
   local cluster="$1" region="${AWS_REGION:-$(aws configure get region 2>/dev/null)}"
   command -v aws >/dev/null 2>&1 || return 0
+  # Scope strictly to THIS cluster's own VPC as well as the cluster tag. The
+  # elbv2.k8s.aws/cluster tag value is the LB Controller's configured clusterName,
+  # which is only guaranteed unique for EKS within one account+region — so a tag
+  # match alone could (in theory) also match an ALB from a different cluster that
+  # happened to share the name (e.g. a self-managed cluster, or an LBC configured
+  # with the same clusterName). The VPC is unique to this environment, so
+  # requiring VpcId == the cluster's VPC *and* the tag makes an accidental match
+  # on someone else's ALB effectively impossible. Runs in predown while the
+  # cluster still exists, so describe-cluster resolves the VPC reliably; if it
+  # can't (cluster already gone), skip — the post-destroy sweep is the backstop.
+  local vpc
+  vpc="$(aws eks describe-cluster --name "$cluster" --region "$region" \
+    --query 'cluster.resourcesVpcConfig.vpcId' --output text 2>/dev/null)"
+  if [ -z "$vpc" ] || [ "$vpc" = "None" ]; then
+    warn "could not resolve the VPC for '${cluster}' — skipping direct ALB deletion (the orphan sweep will handle it)."
+    return 0
+  fi
   local arn arns
   arns="$(aws elbv2 describe-load-balancers --region "$region" \
-    --query 'LoadBalancers[].LoadBalancerArn' --output text 2>/dev/null)" || return 0
+    --query "LoadBalancers[?VpcId=='${vpc}'].LoadBalancerArn" --output text 2>/dev/null)" || return 0
   for arn in $arns; do
     [ -n "$arn" ] || continue
     if aws elbv2 describe-tags --region "$region" --resource-arns "$arn" \
          --query "TagDescriptions[0].Tags[?Key=='elbv2.k8s.aws/cluster'&&Value=='${cluster}']" \
          --output text 2>/dev/null | grep -q .; then
-      log "Deleting load balancer ${arn##*loadbalancer/} for '${cluster}' so its ENIs release the frontend security group…"
+      log "Deleting load balancer ${arn##*loadbalancer/} (VPC ${vpc}) for '${cluster}' so its ENIs release the frontend security group…"
       aws elbv2 delete-load-balancer --region "$region" --load-balancer-arn "$arn" >/dev/null 2>&1 || true
     fi
   done

@@ -144,9 +144,16 @@ class Sweeper:
             self._err("ENIs", e)
 
     # ---- cluster-scoped orphans (money + hygiene) --------------------------
-    def clear_load_balancers(self):
+    def clear_load_balancers(self, vpc):
         try:
             for lb in self.elbv2.describe_load_balancers().get("LoadBalancers", []):
+                # Scope to THIS env's VPC in addition to the cluster tag. The
+                # elbv2.k8s.aws/cluster tag value (the LB Controller's clusterName)
+                # is only unique for EKS within an account+region, so pairing it
+                # with the env's unique VPC id ensures we never delete an ALB that
+                # merely shares the cluster name elsewhere in the account.
+                if lb.get("VpcId") != vpc:
+                    continue
                 tags = self.elbv2.describe_tags(ResourceArns=[lb["LoadBalancerArn"]]).get("TagDescriptions", [])
                 tl = tags[0].get("Tags", []) if tags else []
                 if self._has_cluster_tag(tl):
@@ -253,7 +260,7 @@ class Sweeper:
         vpc = self.find_vpc()
         if vpc:
             print(f"  [sweep] VPC {vpc} still present — clearing its dependencies so destroy can complete", flush=True)
-            self.clear_load_balancers()
+            self.clear_load_balancers(vpc)
             self.clear_vpc_blockers(vpc)
         # cluster-scoped orphans (safe whether or not the VPC is gone)
         self.clear_fleets()
