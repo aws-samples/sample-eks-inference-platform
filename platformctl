@@ -160,6 +160,32 @@ purge_env_definition() {
   fi
 }
 
+# Delete the ALB(s) the AWS Load Balancer Controller provisioned for this
+# cluster's Ingresses, directly and deterministically. The controller tags every
+# ALB it creates with `elbv2.k8s.aws/cluster=<cluster>`. We delete by that tag
+# instead of only deleting the Ingress and hoping the controller reacts before
+# it is itself torn down — because if the controller is slow (or already gone),
+# the ALB is orphaned and its ENIs keep the frontend security group alive, so
+# Terraform's SG delete fails with a DependencyViolation and the whole
+# `destroy-all` stalls until timeout. Removing the ALB here guarantees the ENIs
+# release well before Terraform reaches that SG. Best-effort — never fatal.
+_predown_delete_albs() {
+  local cluster="$1" region="${AWS_REGION:-$(aws configure get region 2>/dev/null)}"
+  command -v aws >/dev/null 2>&1 || return 0
+  local arn arns
+  arns="$(aws elbv2 describe-load-balancers --region "$region" \
+    --query 'LoadBalancers[].LoadBalancerArn' --output text 2>/dev/null)" || return 0
+  for arn in $arns; do
+    [ -n "$arn" ] || continue
+    if aws elbv2 describe-tags --region "$region" --resource-arns "$arn" \
+         --query "TagDescriptions[0].Tags[?Key=='elbv2.k8s.aws/cluster'&&Value=='${cluster}']" \
+         --output text 2>/dev/null | grep -q .; then
+      log "Deleting load balancer ${arn##*loadbalancer/} for '${cluster}' so its ENIs release the frontend security group…"
+      aws elbv2 delete-load-balancer --region "$region" --load-balancer-arn "$arn" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
 # Before Terraform runs, delete the in-cluster objects whose controllers create
 # AWS resources Terraform does NOT manage — chiefly the Ingresses, which the AWS
 # Load Balancer Controller turns into an ALB that holds the frontend security
@@ -181,6 +207,11 @@ _predown_drain() {
   kubectl --context "$env" delete application --all -n argocd --wait=false >/dev/null 2>&1 || true
   kubectl --context "$env" delete vllmendpoints,llmdendpoints,llmddisaggendpoints,aiteams --all -A --wait=false >/dev/null 2>&1 || true
   kubectl --context "$env" delete ingress --all -A --wait=false >/dev/null 2>&1 || true
+  # Deterministically remove the controller-managed ALB(s) too: deleting the
+  # Ingress asks the controller to tear the ALB down, but the controller may be
+  # slow or already gone, which orphans the ALB and blocks the frontend SG
+  # delete during destroy. This makes ALB removal independent of that timing.
+  _predown_delete_albs "$cluster"
   for _ in $(seq 1 30); do
     [ -z "$(kubectl --context "$env" get ingress -A --no-headers 2>/dev/null)" ] && { ok "Ingresses cleared — the ALB has been released."; return 0; }
     sleep 6

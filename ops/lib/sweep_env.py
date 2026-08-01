@@ -58,7 +58,7 @@ class Sweeper:
             k, v = t.get("Key", ""), t.get("Value", "")
             if k == f"kubernetes.io/cluster/{self.cluster}":
                 return True
-            if k in ("eks:cluster-name", "aws:eks:cluster-name", "karpenter.sh/discovery", "cluster-name") and v == self.cluster:
+            if k in ("eks:cluster-name", "aws:eks:cluster-name", "karpenter.sh/discovery", "cluster-name", "elbv2.k8s.aws/cluster") and v == self.cluster:
                 return True
             if k == "Name" and self.cluster in v:
                 return True
