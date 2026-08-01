@@ -212,15 +212,31 @@ _predown_drain() {
   # slow or already gone, which orphans the ALB and blocks the frontend SG
   # delete during destroy. This makes ALB removal independent of that timing.
   _predown_delete_albs "$cluster"
-  for _ in $(seq 1 30); do
-    [ -z "$(kubectl --context "$env" get ingress -A --no-headers 2>/dev/null)" ] && { ok "Ingresses cleared — the ALB has been released."; return 0; }
+  # Give the controllers a short window to remove their objects gracefully…
+  for _ in $(seq 1 20); do
+    [ -z "$(kubectl --context "$env" get ingress -A --no-headers 2>/dev/null)" ] && break
     sleep 6
   done
-  warn "Ingresses still terminating after 3 min — the ALB controller is likely already gone. Stripping the stuck load-balancer finalizers so the namespace can terminate during destroy…"
-  local r
-  for r in $(kubectl --context "$env" get ingress,targetgroupbindings -n "$NS_PLATFORM" -o name 2>/dev/null); do
-    kubectl --context "$env" patch -n "$NS_PLATFORM" "$r" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+  # …then ALWAYS clear finalizers that a torn-down controller would otherwise
+  # never remove. Left in place, each of these hangs Terraform's namespace
+  # deletes for many minutes (until timeout), regardless of whether the Ingresses
+  # cleared above — the reason `down` used to need manual `kubectl patch`:
+  #   - elbv2.k8s.aws/resources on Ingresses + TargetGroupBindings (AWS LB
+  #     Controller — gone once its addon/nodes are torn down), and
+  #   - litellm.ai-platform/deregister on the serving-tier CRs (litellm-sync).
+  # Every one of these objects is being destroyed anyway, so clearing their
+  # finalizers cluster-wide is safe and makes `down` need no manual cleanup.
+  log "Clearing leftover controller finalizers so namespaces terminate cleanly during destroy…"
+  local kind r
+  for kind in ingress targetgroupbindings.elbv2.k8s.aws vllmendpoints.kro.run llmdendpoints.kro.run llmddisaggendpoints.kro.run aiteams.kro.run; do
+    for r in $(kubectl --context "$env" get "$kind" -A \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+      [ -n "$r" ] || continue
+      kubectl --context "$env" patch "$kind" "${r#*/}" -n "${r%%/*}" \
+        --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    done
   done
+  ok "In-cluster drain complete — controller AWS resources released and finalizers cleared."
 }
 
 cmd_down() {
