@@ -18,14 +18,18 @@ Lifecycle (finalizer-driven, self-healing):
      served-model-name = spec.model.
   3. Object WITH deletionTimestamp          -> DEREGISTER the model, then PATCH to
      remove our finalizer so deletion can complete.
-  4. RECONCILE every RECONCILE_INTERVAL_SEC -> re-add finalizers + re-register any
-     model missing from the live router (repairs drift after a LiteLLM restart,
-     which reloads only the static config), and deregister orphaned DB-registered
-     models whose CR no longer exists.
+  4. RECONCILE every RECONCILE_INTERVAL_SEC -> re-add finalizers, ensure every
+     live CR's model is registered (and collapse any duplicate rows), and
+     deregister orphaned DB-registered models whose CR no longer exists.
 
-Registration is idempotent: a model already in the live /v1/models is left alone;
-otherwise a stale DB entry is removed and the model re-added (so it lands back in
-the running router). Deregistration only ever touches DB-registered models
+Registration is idempotent, duplicate-safe, and serialized under a single lock
+(REGISTRY_LOCK) shared by the watch threads and the reconcile loop. It is
+*monotonic*: it only POSTs /model/new when the name has NO DB row, and otherwise
+only deletes extra rows (keep one, delete the rest). Never adding while a row
+exists means concurrent callers reading LiteLLM's eventually-consistent
+/model/info can only ever shrink the row count — so a model always converges to
+exactly one entry and can never accumulate duplicates. Deregistration deletes
+ALL rows for a name and only ever touches DB-registered models
 (model_info.db_model == True) — static config models (e.g. the Bedrock
 claude-opus-4-8 in litellm.yaml) have db_model == False and are never deleted.
 
@@ -146,43 +150,32 @@ def list_db_model_ids() -> dict[str, list[str]] | None:
     return result
 
 
-def list_served_names() -> set[str] | None:
-    """Names currently in the live router (/v1/models). None if unreachable."""
-    served = _litellm_request("GET", "/v1/models")
-    if served is None:
-        return None
-    return {m["id"] for m in served.get("data", []) or [] if m.get("id")}
-
-
 def register_model(name: str, model_id: str, api_base: str) -> bool:
-    """Ensure `name` is registered exactly once and live in LiteLLM's router.
+    """Ensure `name` is registered exactly once in LiteLLM. Duplicate-safe.
 
-    Idempotent, duplicate-safe, and self-healing. Held under REGISTRY_LOCK so a
-    concurrent watch + reconcile can't both add the same model:
+    Held under REGISTRY_LOCK so a concurrent watch + reconcile can't both add the
+    same model. Crucially, this is *monotonic*: it only ADDS when there is no DB
+    row for the name, and otherwise only REMOVES extra rows (keep the first,
+    delete the rest). It never adds while a row already exists.
 
-      - exactly one DB row AND live in /v1/models -> leave as-is (fast path);
-      - otherwise (missing, OR duplicated across multiple DB rows, OR present in
-        the DB but absent from the live router after a LiteLLM restart) -> delete
-        EVERY existing DB row for the name, then add a single fresh one.
-
-    Deleting *all* rows for the name (not just one) is what collapses duplicates
-    that a name->id map would hide, so an already-duplicated model self-heals to
-    a single entry on the next event/reconcile.
+    That monotonicity is what makes it robust against LiteLLM's eventually-
+    consistent /model/info: an earlier delete-all-then-add design could act on a
+    stale read (see fewer rows than really exist, delete those, add one) and so
+    *grow* duplicates under startup churn. Because this version never adds when a
+    row is present, repeated passes can only shrink the row count — so it always
+    converges to exactly one, even if reads lag writes.
     """
     with REGISTRY_LOCK:
         db_models = list_db_model_ids()
         if db_models is None:
             return False
-        served = list_served_names()
-        if served is None:
-            return False
         ids = db_models.get(name, [])
-        if len(ids) == 1 and name in served:
-            return True
-        for stale_id in ids:
-            _litellm_request("POST", "/model/delete", {"id": stale_id})
         if ids:
-            log.info("register %s: cleared %d stale/duplicate DB row(s) before re-adding", name, len(ids))
+            for extra_id in ids[1:]:
+                _litellm_request("POST", "/model/delete", {"id": extra_id})
+            if len(ids) > 1:
+                log.info("register %s: removed %d duplicate DB row(s)", name, len(ids) - 1)
+            return True
         resp = _litellm_request("POST", "/model/new", {
             "model_name": name,
             "litellm_params": {"model": f"openai/{model_id}", "api_base": api_base, "api_key": "no-key"},
