@@ -169,37 +169,69 @@ purge_env_definition() {
 # Terraform's SG delete fails with a DependencyViolation and the whole
 # `destroy-all` stalls until timeout. Removing the ALB here guarantees the ENIs
 # release well before Terraform reaches that SG. Best-effort — never fatal.
-_predown_delete_albs() {
-  local cluster="$1" region="${AWS_REGION:-$(aws configure get region 2>/dev/null)}"
-  command -v aws >/dev/null 2>&1 || return 0
-  # Scope strictly to THIS cluster's own VPC as well as the cluster tag. The
-  # elbv2.k8s.aws/cluster tag value is the LB Controller's configured clusterName,
-  # which is only guaranteed unique for EKS within one account+region — so a tag
-  # match alone could (in theory) also match an ALB from a different cluster that
-  # happened to share the name (e.g. a self-managed cluster, or an LBC configured
-  # with the same clusterName). The VPC is unique to this environment, so
-  # requiring VpcId == the cluster's VPC *and* the tag makes an accidental match
-  # on someone else's ALB effectively impossible. Runs in predown while the
-  # cluster still exists, so describe-cluster resolves the VPC reliably; if it
-  # can't (cluster already gone), skip — the post-destroy sweep is the backstop.
-  local vpc
+# Echo THIS cluster's VPC id (empty if unresolvable, e.g. the cluster is gone).
+# Used to scope ALB deletion to the environment's own VPC.
+_cluster_vpc() {
+  local cluster="$1" region="${AWS_REGION:-$(aws configure get region 2>/dev/null)}" vpc
   vpc="$(aws eks describe-cluster --name "$cluster" --region "$region" \
     --query 'cluster.resourcesVpcConfig.vpcId' --output text 2>/dev/null)"
-  if [ -z "$vpc" ] || [ "$vpc" = "None" ]; then
-    warn "could not resolve the VPC for '${cluster}' — skipping direct ALB deletion (the orphan sweep will handle it)."
-    return 0
-  fi
-  local arn arns
-  arns="$(aws elbv2 describe-load-balancers --region "$region" \
-    --query "LoadBalancers[?VpcId=='${vpc}'].LoadBalancerArn" --output text 2>/dev/null)" || return 0
-  for arn in $arns; do
+  [ "$vpc" = "None" ] && vpc=""
+  echo "$vpc"
+}
+
+# Delete the ALB(s) the AWS Load Balancer Controller created for this cluster,
+# scoped to BOTH the cluster's own VPC ($2) AND the elbv2.k8s.aws/cluster tag so
+# it can never match an ALB from a different same-named cluster elsewhere in the
+# account (the VPC is unique per environment). Best-effort — never fatal.
+_delete_cluster_albs() {
+  local cluster="$1" vpc="$2" region="${AWS_REGION:-$(aws configure get region 2>/dev/null)}" arn
+  command -v aws >/dev/null 2>&1 || return 0
+  [ -n "$vpc" ] || return 0
+  for arn in $(aws elbv2 describe-load-balancers --region "$region" \
+      --query "LoadBalancers[?VpcId=='${vpc}'].LoadBalancerArn" --output text 2>/dev/null); do
     [ -n "$arn" ] || continue
     if aws elbv2 describe-tags --region "$region" --resource-arns "$arn" \
          --query "TagDescriptions[0].Tags[?Key=='elbv2.k8s.aws/cluster'&&Value=='${cluster}']" \
          --output text 2>/dev/null | grep -q .; then
-      log "Deleting load balancer ${arn##*loadbalancer/} (VPC ${vpc}) for '${cluster}' so its ENIs release the frontend security group…"
+      log "Deleting load balancer ${arn##*loadbalancer/} (VPC ${vpc}) for '${cluster}'…"
       aws elbv2 delete-load-balancer --region "$region" --load-balancer-arn "$arn" >/dev/null 2>&1 || true
     fi
+  done
+}
+
+# One quiet, cluster-wide pass that clears the controller finalizers which hang
+# Terraform's namespace deletes once the owning controller is torn down:
+#   - elbv2.k8s.aws/resources on Ingresses + TargetGroupBindings (AWS LB Controller)
+#   - litellm.ai-platform/deregister on the kro serving/team CRs (litellm-sync)
+# Safe: every one of these objects is being destroyed anyway.
+_strip_teardown_finalizers() {
+  local env="$1" kind r
+  for kind in ingress targetgroupbindings.elbv2.k8s.aws vllmendpoints.kro.run llmdendpoints.kro.run llmddisaggendpoints.kro.run aiteams.kro.run; do
+    for r in $(kubectl --context "$env" get "$kind" -A \
+        -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+      [ -n "$r" ] || continue
+      kubectl --context "$env" patch "$kind" "${r#*/}" -n "${r%%/*}" \
+        --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    done
+  done
+}
+
+# Background watchdog for `down`: while the EKS cluster still exists, repeatedly
+# delete its ALBs and clear the hang-causing finalizers. A one-shot predown
+# cleanup loses a race — ArgoCD re-syncs the deleted Ingress, the LB Controller
+# then re-creates the ALB + TargetGroupBindings (with fresh finalizers), and
+# litellm-sync re-adds its finalizer, all faster than destroy tears those
+# controllers down. Looping until the cluster is gone defeats every re-creation:
+# whatever a still-running controller puts back, the next pass removes, and the
+# final pass (after Terraform has torn the controllers down) sticks — so `down`
+# finishes with no manual `kubectl patch` / ALB deletion. Runs quietly in the
+# background for the whole destroy; cmd_down kills it when destroy-all returns.
+_teardown_watchdog() {
+  local env="$1" cluster="$2" vpc="$3" region="${AWS_REGION:-$(aws configure get region 2>/dev/null)}"
+  while aws eks describe-cluster --name "$cluster" --region "$region" >/dev/null 2>&1; do
+    _delete_cluster_albs "$cluster" "$vpc"
+    _strip_teardown_finalizers "$env"
+    sleep 8
   done
 }
 
@@ -224,35 +256,20 @@ _predown_drain() {
   kubectl --context "$env" delete application --all -n argocd --wait=false >/dev/null 2>&1 || true
   kubectl --context "$env" delete vllmendpoints,llmdendpoints,llmddisaggendpoints,aiteams --all -A --wait=false >/dev/null 2>&1 || true
   kubectl --context "$env" delete ingress --all -A --wait=false >/dev/null 2>&1 || true
-  # Deterministically remove the controller-managed ALB(s) too: deleting the
-  # Ingress asks the controller to tear the ALB down, but the controller may be
-  # slow or already gone, which orphans the ALB and blocks the frontend SG
-  # delete during destroy. This makes ALB removal independent of that timing.
-  _predown_delete_albs "$cluster"
+  # Deterministically remove the controller-managed ALB(s) too (best-effort here;
+  # the teardown watchdog in cmd_down keeps doing this in a loop to beat the
+  # controller re-creation race — see _teardown_watchdog).
+  _delete_cluster_albs "$cluster" "$(_cluster_vpc "$cluster")"
   # Give the controllers a short window to remove their objects gracefully…
   for _ in $(seq 1 20); do
     [ -z "$(kubectl --context "$env" get ingress -A --no-headers 2>/dev/null)" ] && break
     sleep 6
   done
-  # …then ALWAYS clear finalizers that a torn-down controller would otherwise
-  # never remove. Left in place, each of these hangs Terraform's namespace
-  # deletes for many minutes (until timeout), regardless of whether the Ingresses
-  # cleared above — the reason `down` used to need manual `kubectl patch`:
-  #   - elbv2.k8s.aws/resources on Ingresses + TargetGroupBindings (AWS LB
-  #     Controller — gone once its addon/nodes are torn down), and
-  #   - litellm.ai-platform/deregister on the serving-tier CRs (litellm-sync).
-  # Every one of these objects is being destroyed anyway, so clearing their
-  # finalizers cluster-wide is safe and makes `down` need no manual cleanup.
+  # …then clear finalizers that a torn-down controller would otherwise never
+  # remove (the reason `down` used to need manual `kubectl patch`). This is a
+  # one-shot pass; the watchdog repeats it during destroy to beat re-adds.
   log "Clearing leftover controller finalizers so namespaces terminate cleanly during destroy…"
-  local kind r
-  for kind in ingress targetgroupbindings.elbv2.k8s.aws vllmendpoints.kro.run llmdendpoints.kro.run llmddisaggendpoints.kro.run aiteams.kro.run; do
-    for r in $(kubectl --context "$env" get "$kind" -A \
-        -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null); do
-      [ -n "$r" ] || continue
-      kubectl --context "$env" patch "$kind" "${r#*/}" -n "${r%%/*}" \
-        --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
-    done
-  done
+  _strip_teardown_finalizers "$env"
   ok "In-cluster drain complete — controller AWS resources released and finalizers cleared."
 }
 
@@ -275,11 +292,28 @@ cmd_down() {
   # resources + that data source from the destroy plan and clears them from state.
   _edge_set_tfvar "$env" false
   _predown_drain "$env"
+  # Start the teardown watchdog: it loops (delete ALBs + clear finalizers) until
+  # the EKS cluster is gone, defeating the controller re-creation race that a
+  # one-shot predown cleanup can't (ArgoCD re-syncing Ingresses, the LB Controller
+  # re-creating the ALB/TargetGroupBindings, litellm-sync re-adding its
+  # finalizer). Without it, destroy stalls on the frontend SG and on namespace
+  # deletes, needing manual `kubectl patch`. Killed as soon as destroy returns.
+  local _wd_cluster _wd_vpc _wd_pid=""
+  _wd_cluster="$(cluster_of "$env")"
+  _wd_vpc="$(_cluster_vpc "$_wd_cluster")"
+  if command -v kubectl >/dev/null 2>&1 && command -v aws >/dev/null 2>&1; then
+    log "Starting teardown watchdog (keeps ALBs + finalizers cleared until the cluster is gone)…"
+    _teardown_watchdog "$env" "$_wd_cluster" "$_wd_vpc" &
+    _wd_pid=$!
+    trap '[ -n "'"$_wd_pid"'" ] && kill "'"$_wd_pid"'" 2>/dev/null; trap - EXIT INT TERM' EXIT INT TERM
+  fi
   if ! make -C "$TF_DIR" destroy-all ENVIRONMENT="$env"; then
     warn "Terraform destroy hit leftover dependencies — sweeping orphans and retrying once."
     _postdown_sweep "$env"
     make -C "$TF_DIR" destroy-all ENVIRONMENT="$env" || warn "destroy still failing after the sweep — inspect the error above; re-running './platformctl down ${env}' is safe (idempotent)."
   fi
+  # Stop the watchdog now that destroy has finished (cluster gone or given up).
+  if [ -n "$_wd_pid" ]; then kill "$_wd_pid" 2>/dev/null || true; trap - EXIT INT TERM; fi
   # Final sweep: clear post-destroy orphans Terraform never manages so nothing
   # lingers billing (Karpenter instance-profiles, EKS KMS key + log groups, etc.).
   _postdown_sweep "$env"
