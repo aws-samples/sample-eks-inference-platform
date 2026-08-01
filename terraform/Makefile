@@ -160,9 +160,21 @@ plan: init tf-select-ws
 # in state yet (the very first apply); it's a no-op on every apply after that.
 apply: init tf-select-ws
 	@echo ENVIRONMENT=$(ENVIRONMENT) MODULE=$(MODULE) terraform::apply
+	@# First apply of the cluster module is done in two phases: a targeted apply
+	@# brings up module.eks so the Kubernetes/Helm/kubectl providers can configure
+	@# against a live cluster, then the full apply runs. module.ebs_csi_driver_irsa
+	@# is targeted alongside module.eks because the aws-ebs-csi-driver EKS addon
+	@# (inside module.eks) references only that module's IAM ROLE ARN — so a bare
+	@# `-target=module.eks` pulls in the role but NOT the module's policy
+	@# attachment, and the addon then comes up against a permission-less role
+	@# (ec2:DescribeAvailabilityZones 403) and hangs until its 20-min timeout.
+	@# Targeting the IRSA module too ensures the AmazonEBSCSIDriverPolicy is
+	@# attached in the same phase. (This block only runs for the module that
+	@# contains `module "eks"`, i.e. 30.eks/30.cluster, which is the only module
+	@# that declares module.ebs_csi_driver_irsa.)
 	@if grep -rqsE '^[[:space:]]*module[[:space:]]+"eks"' $(MODULE)/*.tf 2>/dev/null && ! terraform -chdir=$(MODULE) state list 2>/dev/null | grep -q '^module\.eks'; then \
 		echo ">> First apply: creating the EKS cluster (module.eks) first so the Kubernetes providers can configure"; \
-		terraform -chdir=$(MODULE) apply -target=module.eks -input=false -lock=true -auto-approve -var-file=$(VAR_FILE) 2>&1 | tee -a tf-logs/$(notdir $(MODULE))-apply.log || { echo "targeted module.eks apply failed for $(MODULE)"; exit 1; }; \
+		terraform -chdir=$(MODULE) apply -target=module.eks -target=module.ebs_csi_driver_irsa -input=false -lock=true -auto-approve -var-file=$(VAR_FILE) 2>&1 | tee -a tf-logs/$(notdir $(MODULE))-apply.log || { echo "targeted module.eks apply failed for $(MODULE)"; exit 1; }; \
 	fi
 	@$(call execute_terraform,$(MODULE),apply,"-auto-approve")
 

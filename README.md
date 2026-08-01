@@ -73,12 +73,26 @@ tracing apply uniformly — including the optional **llm-d** scale tier
 - **Terraform**, **kubectl**, **make**, **jq**, **git**, and **python3** with **boto3**
 
 **AWS account setup**:
-- An **IAM Identity Center** instance — its ARN goes in the tfvars (ArgoCD SSO)
+- An **IAM Identity Center** instance — its ARN and the SSO user who should get
+  ArgoCD admin go in the tfvars (`argocd_idc_instance_arn`, `argocd_idc_region`,
+  and `argocd_rbac_mappings`). **Its region can differ from your deploy `region`**
+  — Identity Center is one instance per account (often in a different region than
+  where you deploy this platform), so set `argocd_idc_region` to *that* region, not
+  necessarily your deploy region. Find your instance + a user id with:
+  ```bash
+  # Instance ARN + region (try the regions you may have enabled it in):
+  for r in us-east-1 us-west-2 eu-west-1 eu-central-1; do \
+    aws sso-admin list-instances --region $r \
+      --query 'Instances[].[InstanceArn,IdentityStoreId]' --output text; done
+  # SSO user id for argocd_rbac_mappings (use the IdentityStoreId + region above):
+  aws identitystore list-users --identity-store-id <d-xxxx> --region <idc-region> \
+    --query 'Users[].[UserName,UserId]' --output text
+  ```
 - **Amazon Bedrock model access** enabled in your region (for the day-one Claude Opus — enable it in the Bedrock console)
 - Enough **service quota** for the GPU instance types you plan to self-host on (not needed for the Bedrock-only path)
 - A **fork of this repo** that ArgoCD can read — its URL goes in `gitops_repo_url`
 
-**Configure** — copy `terraform/00.global/vars/example.tfvars` to `<env>.tfvars` and fill the `REPLACE` markers: your Identity Center ARN, `gitops_repo_url` (your fork), `region`, and a unique `resources_prefix`.
+**Configure** — copy `terraform/00.global/vars/example.tfvars` to `<env>.tfvars` and fill the `REPLACE` markers: your Identity Center ARN + **its region** (`argocd_idc_region`, may differ from `region`) + your **SSO user id** (`argocd_rbac_mappings`), `gitops_repo_url` (your fork), `region`, and a unique `resources_prefix`.
 
 > Keep `private_eks_cluster = false` (the default). A private-only cluster's API is
 > reachable only from inside the VPC, so `./platformctl up` from a laptop can't

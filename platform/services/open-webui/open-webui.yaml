@@ -33,6 +33,20 @@ spec:
           ports:
             - containerPort: 8080
           env:
+            # Open WebUI treats OPENAI_API_BASE_URL / OPENAI_API_KEY (and most
+            # other settings) as PersistentConfig: with the default
+            # ENABLE_PERSISTENT_CONFIG=true it reads them from env ONLY on the
+            # very first boot, writes them into webui.db, and thereafter the DB
+            # value wins and env changes are ignored. On a fresh install this
+            # pod boots BEFORE the litellm-openwebui-key Job has minted the key
+            # (OPENAI_API_KEY secret is optional -> empty), so the EMPTY key gets
+            # frozen into the DB; the Job's later rollout-restart can't override
+            # it, and Open WebUI calls LiteLLM with an empty key -> no models
+            # show at first login. Setting this false makes env authoritative on
+            # every boot, so once the key Secret exists the restart picks it up.
+            # (All of this UI's config is delivered declaratively via env here.)
+            - name: ENABLE_PERSISTENT_CONFIG
+              value: "false"
             - name: OPENAI_API_BASE_URL
               value: "http://litellm.ai-platform.svc.cluster.local:4000/v1"
             # Scoped, NON-admin LiteLLM virtual key — NOT the master key. The

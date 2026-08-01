@@ -83,6 +83,13 @@ KINDS = {
 
 stop_event = threading.Event()
 
+# Serializes ALL LiteLLM registry mutations (register/deregister). The watch
+# threads (one per kind) and the reconcile thread can otherwise call into the
+# registry concurrently for the same model; without this lock two callers can
+# both observe "not registered" and each POST /model/new, creating duplicate DB
+# rows for one CR (the symptom: a model showing up 2-3× in the LiteLLM UI).
+REGISTRY_LOCK = threading.Lock()
+
 
 def _stop(*_: object) -> None:
     log.info("shutdown requested")
@@ -115,16 +122,19 @@ def _litellm_request(method: str, path: str, body: dict | None = None) -> dict |
     return None
 
 
-def list_db_models() -> dict[str, str] | None:
-    """Return {model_name: model_id} for DB-registered models only.
+def list_db_model_ids() -> dict[str, list[str]] | None:
+    """Return {model_name: [model_id, ...]} for DB-registered models only.
 
-    Static config-file models (db_model == False) are excluded so they can
-    never be selected for deletion. Returns None if LiteLLM is unreachable.
+    Unlike a name->id map, this preserves EVERY DB row for a name, so duplicate
+    registrations of the same model (multiple rows sharing one model_name) are
+    visible and can be cleaned up. Static config-file models (db_model == False)
+    are excluded so they can never be selected for deletion. Returns None if
+    LiteLLM is unreachable.
     """
     info = _litellm_request("GET", "/model/info")
     if info is None:
         return None
-    result: dict[str, str] = {}
+    result: dict[str, list[str]] = {}
     for entry in info.get("data", []) or []:
         model_info = entry.get("model_info") or {}
         if not model_info.get("db_model"):
@@ -132,7 +142,7 @@ def list_db_models() -> dict[str, str] | None:
         name = entry.get("model_name")
         model_id = model_info.get("id")
         if name and model_id:
-            result[name] = model_id
+            result.setdefault(name, []).append(model_id)
     return result
 
 
@@ -145,49 +155,67 @@ def list_served_names() -> set[str] | None:
 
 
 def register_model(name: str, model_id: str, api_base: str) -> bool:
-    """Ensure `name` is registered and live in LiteLLM's router.
+    """Ensure `name` is registered exactly once and live in LiteLLM's router.
 
-    Idempotent + self-healing: if the name is already in the live /v1/models it's
-    left as-is; otherwise any stale DB entry for the name is removed (covers a
-    name lingering in the DB but absent from the router after a LiteLLM restart)
-    and the model is (re-)added so it lands in the running router.
+    Idempotent, duplicate-safe, and self-healing. Held under REGISTRY_LOCK so a
+    concurrent watch + reconcile can't both add the same model:
+
+      - exactly one DB row AND live in /v1/models -> leave as-is (fast path);
+      - otherwise (missing, OR duplicated across multiple DB rows, OR present in
+        the DB but absent from the live router after a LiteLLM restart) -> delete
+        EVERY existing DB row for the name, then add a single fresh one.
+
+    Deleting *all* rows for the name (not just one) is what collapses duplicates
+    that a name->id map would hide, so an already-duplicated model self-heals to
+    a single entry on the next event/reconcile.
     """
-    served = list_served_names()
-    if served is None:
-        return False
-    if name in served:
+    with REGISTRY_LOCK:
+        db_models = list_db_model_ids()
+        if db_models is None:
+            return False
+        served = list_served_names()
+        if served is None:
+            return False
+        ids = db_models.get(name, [])
+        if len(ids) == 1 and name in served:
+            return True
+        for stale_id in ids:
+            _litellm_request("POST", "/model/delete", {"id": stale_id})
+        if ids:
+            log.info("register %s: cleared %d stale/duplicate DB row(s) before re-adding", name, len(ids))
+        resp = _litellm_request("POST", "/model/new", {
+            "model_name": name,
+            "litellm_params": {"model": f"openai/{model_id}", "api_base": api_base, "api_key": "no-key"},
+        })
+        if resp is None:
+            return False
+        log.info("registered model %s -> %s", name, api_base)
         return True
-    db_models = list_db_models()
-    if db_models is None:
-        return False
-    if name in db_models:
-        _litellm_request("POST", "/model/delete", {"id": db_models[name]})
-        log.info("register %s: removed stale DB entry %s before re-adding", name, db_models[name])
-    resp = _litellm_request("POST", "/model/new", {
-        "model_name": name,
-        "litellm_params": {"model": f"openai/{model_id}", "api_base": api_base, "api_key": "no-key"},
-    })
-    if resp is None:
-        return False
-    log.info("registered model %s -> %s", name, api_base)
-    return True
 
 
 def deregister_model(name: str) -> bool:
-    """Delete a DB-registered model from LiteLLM by display name. Idempotent."""
-    db_models = list_db_models()
-    if db_models is None:
-        log.warning("deregister %s: LiteLLM unreachable — will retry on reconcile", name)
-        return False
-    model_id = db_models.get(name)
-    if model_id is None:
-        log.info("deregister %s: not a DB-registered model (already gone or static) — skipping", name)
-        return True
-    resp = _litellm_request("POST", "/model/delete", {"id": model_id})
-    if resp is None:
-        return False
-    log.info("deregistered model %s (id=%s) from LiteLLM", name, model_id)
-    return True
+    """Delete ALL DB-registered rows for a model by display name. Idempotent.
+
+    Removes every row sharing the name (not just one) so a model that was
+    accidentally registered multiple times is fully removed. Held under
+    REGISTRY_LOCK to stay consistent with register_model.
+    """
+    with REGISTRY_LOCK:
+        db_models = list_db_model_ids()
+        if db_models is None:
+            log.warning("deregister %s: LiteLLM unreachable — will retry on reconcile", name)
+            return False
+        ids = db_models.get(name, [])
+        if not ids:
+            log.info("deregister %s: not a DB-registered model (already gone or static) — skipping", name)
+            return True
+        ok = True
+        for model_id in ids:
+            if _litellm_request("POST", "/model/delete", {"id": model_id}) is None:
+                ok = False
+        if ok:
+            log.info("deregistered model %s (%d row(s)) from LiteLLM", name, len(ids))
+        return ok
 
 
 # ---------------------------------------------------------------------------
@@ -320,7 +348,7 @@ def reconcile_once(custom: client.CustomObjectsApi) -> None:
     # (otherwise a transient API error could wrongly deregister everything).
     if not any_kind_listed:
         return
-    db_models = list_db_models()
+    db_models = list_db_model_ids()
     if db_models is None:
         return
     for name in db_models:

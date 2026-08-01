@@ -53,14 +53,25 @@ cluster_config = {
 
   # Required when gitops = true
   # See: https://docs.aws.amazon.com/eks/latest/userguide/argocd.html
+  #
+  # IAM Identity Center is ONE instance per account and is often enabled in a
+  # different region than where you deploy this platform. argocd_idc_region is
+  # therefore INDEPENDENT of `region` above — set it to the region your Identity
+  # Center instance actually lives in (it may or may not match your deploy region).
+  # Discover the instance ARN + identity store, and a user id, with:
+  #   for r in us-east-1 us-west-2 eu-west-1 eu-central-1; do \
+  #     aws sso-admin list-instances --region $r \
+  #       --query 'Instances[].[InstanceArn,IdentityStoreId]' --output text; done
+  #   aws identitystore list-users --identity-store-id <d-xxxx> --region <idc-region> \
+  #     --query 'Users[].[UserName,UserId]' --output text
   capabilities_config = {
     argocd_idc_instance_arn = "arn:aws:sso:::instance/ssoins-XXXXXXXXXX" # REPLACE
-    argocd_idc_region       = "us-east-1"                                # REPLACE
+    argocd_idc_region       = "us-east-1"                                # REPLACE — the Identity Center instance's region (may differ from `region`)
     argocd_rbac_mappings = [
       {
         role = "ADMIN"
         identities = [
-          { id = "REPLACE-WITH-SSO-USER-ID", type = "SSO_USER" }
+          { id = "REPLACE-WITH-SSO-USER-ID", type = "SSO_USER" } # REPLACE — a UserId from `aws identitystore list-users` above (NOT the user name)
         ]
       }
     ]

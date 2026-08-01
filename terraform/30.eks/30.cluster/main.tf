@@ -126,6 +126,18 @@ module "eks" {
       aws-ebs-csi-driver = {
         service_account_role_arn = module.ebs_csi_driver_irsa[0].iam_role_arn
         preserve                 = false
+        # Pinned to a known-good, verified end-to-end release for reproducible
+        # deploys (matches kubernetes_version 1.36 above — the EKS add-on version
+        # is coupled to the cluster's Kubernetes version, so bump this in lockstep
+        # when you change kubernetes_version). Find valid versions with:
+        #   aws eks describe-addon-versions --addon-name aws-ebs-csi-driver \
+        #     --kubernetes-version <ver> --query \
+        #     'addons[].addonVersions[].addonVersion'
+        # NOTE: pinning the version was NOT what fixed the first-deploy hang — see
+        # the two-phase targeted apply in terraform/Makefile (module.ebs_csi_driver_irsa
+        # must be created with module.eks so the IAM policy is attached before the
+        # addon's health check runs).
+        addon_version = "v1.63.1-eksbuild.1"
         configuration_values = jsonencode({
           sidecars = {
             snapshotter = {
