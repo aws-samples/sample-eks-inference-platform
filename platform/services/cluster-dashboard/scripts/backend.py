@@ -605,6 +605,31 @@ def _compute_cost(nodes: list) -> dict:
     }
 
 
+def _tok_per_dollar(tps, cost_hr):
+    """Serving efficiency: tokens produced per US dollar of serving cost.
+
+    Combines the two data sources the platform already has — LiteLLM throughput
+    and the cost engine — into one comparable number across every tier:
+      * tps      = tokens/sec (LiteLLM 5-min rate, from _litellm_metrics)
+      * cost_hr  = $/hr for the model — GPU node cost for self-hosted vLLM/llm-d
+                   (attributed by which node the pods run on), or token spend for
+                   Bedrock (spend5m×12). Both are already on the per-model record.
+    tokens/hr (tps×3600) ÷ $/hr = tokens/$.
+
+    Returns None when there is no cost basis (idle/unpriced model → ratio
+    undefined), and 0 when the model costs money but produced no tokens in the
+    window — an idle-but-billing model, which is exactly the inefficiency this
+    view is meant to surface."""
+    try:
+        c = float(cost_hr or 0)
+        t = float(tps or 0)
+    except (TypeError, ValueError):
+        return None
+    if c <= 0:
+        return None
+    return round(t * 3600.0 / c)
+
+
 def _normalize_endpoint(ep: dict, mode: str) -> dict:
     """Flatten a serving CR (any of the three kinds) into one dashboard record
     with a `mode` field. Status is normalized so the UI can render all kinds
@@ -1305,6 +1330,10 @@ def _build_metrics(nodes: list, pods: list) -> dict:
             m["costHr"] = round(pm["spend5m"] * 12, 2)
         h = met["health"].get(m["name"])
         m["health"] = h["status"] if h else ""
+        # Efficiency: tokens/$ from the model's live throughput (tps) and its
+        # $/hr cost basis (GPU node cost for self-hosted, token spend for
+        # Bedrock) — both already set above, so this is a pure derivation.
+        m["tokPerDollar"] = _tok_per_dollar(m.get("tps"), m.get("costHr"))
     models.sort(key=lambda x: (-(x.get("rpm") or 0), x["name"]))
 
     gpu = []
@@ -1346,7 +1375,12 @@ def _build_metrics(nodes: list, pods: list) -> dict:
         provisioning = []
 
     by_model = sorted([[m["name"], m["costHr"], m["tier"]] for m in models if m["costHr"] > 0], key=lambda x: -x[1])
-    cost_ext = {"byModel": by_model, "byTeam": met.get("byTeam", []), "trend": met.get("trend", []), "byUser": met.get("byUser", [])}
+    # Tokens-per-dollar leaderboard, most-efficient first. Models with a cost
+    # basis but zero throughput (idle-but-billing → 0) sink to the bottom, where
+    # the view flags them as wasted spend.
+    by_eff = sorted([[m["name"], m["tokPerDollar"], m["tier"]] for m in models
+                     if m.get("tokPerDollar") is not None], key=lambda x: -x[1])
+    cost_ext = {"byModel": by_model, "byTeam": met.get("byTeam", []), "trend": met.get("trend", []), "byUser": met.get("byUser", []), "byEfficiency": by_eff}
     # Autoscaling: per-pool KEDA/HPA state + bottleneck signal, attached to each
     # model (disagg models get two entries: prefill + decode, scaling
     # independently). Replaces the now-deprecated spec replica counts with the

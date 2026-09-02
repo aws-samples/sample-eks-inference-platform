@@ -319,6 +319,7 @@ tbody tr:hover{background:var(--surface-2)}
         <div style="display:flex;flex-direction:column;gap:16px">
           <div class="card"><div class="card-h"><h3>By team</h3></div><div id="cost-by-team"></div></div>
           <div class="card"><div class="card-h"><h3>Spend trend</h3></div><div id="cost-trend"></div></div>
+          <div class="card"><div class="card-h"><h3>Tokens per $</h3></div><div id="cost-by-efficiency"></div></div>
         </div>
       </div>
       <div class="card" style="margin-top:16px"><div class="card-h"><h3>Cost &amp; usage by user (last 30d)</h3></div><div id="cost-by-user"></div></div>
@@ -422,6 +423,11 @@ function costViews(){const c=D.cost||{},ce=D.costExt||{};const src=c.priceSource
   const bm=ce.byModel||[];const mx=Math.max(1,...bm.map(x=>x[1]));$('cost-by-model').innerHTML=bm.length?bm.map(x=>`<div style="margin-bottom:10px"><div class="bar-lbl"><span>${tierBadge(x[2])} ${esc(x[0])}</span><span>$${x[1].toFixed(2)}/hr</span></div><div class="bar"><i style="width:${x[1]/mx*100}%;background:var(--purple)"></i></div></div>`).join(''):'<div class="muted">No GPU-backed models running</div>';
   const bt=ce.byTeam||[];const mt=Math.max(1,...bt.map(x=>x[1]));$('cost-by-team').innerHTML=bt.length?bt.map(x=>`<div style="margin-bottom:10px"><div class="bar-lbl"><span>${esc(x[0])}</span><span>$${x[1].toFixed(2)}</span></div><div class="bar"><i style="width:${x[1]/mt*100}%;background:var(--accent)"></i></div></div>`).join(''):'<div class="muted">No team spend today</div>';
   const tr=ce.trend||[];$('cost-trend').innerHTML=tr.length>1?spark(tr.map(x=>x[1]),'var(--green)',360,60)+`<div class="muted" style="font-size:11px;margin-top:6px">last ${tr.length} days · spend/day</div>`:'<div class="muted">trend builds as usage accrues</div>';
+  const be=ce.byEfficiency||[];const cbe=$('cost-by-efficiency');
+  if(cbe){
+    const mxe=Math.max(1,...be.map(x=>x[1]||0));
+    cbe.innerHTML=be.length?be.map(x=>{const v=x[1]||0;const idle=v===0;const w=idle?100:Math.max(4,v/mxe*100);const col=idle?'var(--orange)':'var(--green)';const lbl=idle?'idle · billing':num(Math.round(v))+' tok/$';return `<div style="margin-bottom:10px"><div class="bar-lbl"><span>${tierBadge(x[2])} ${esc(x[0])}</span><span>${lbl}</span></div><div class="bar"><i style="width:${w}%;background:${col}"></i></div></div>`;}).join(''):'<div class="muted">No served models with a cost basis yet</div>';
+  }
   const bu=ce.byUser||[];const cbu=$('cost-by-user');
   if(cbu){
     if(!bu.length){cbu.innerHTML='<div class="muted">No per-user usage yet — interactive Open WebUI users appear here</div>';}
@@ -522,7 +528,7 @@ function openModel(name,keep){const m=(D.models||[]).find(x=>x.name===name);if(!
   $('drawer').innerHTML=`<button class="drawer-x" onclick="closeDrawer()">×</button>
    <div style="display:flex;align-items:center;gap:10px"><span class="dot ${m.status==='running'?'ok':m.status==='error'?'bad':'warn'}"></span><span style="font-size:19px;font-weight:800">${esc(m.name)}</span>${tierBadge(m.tier)}</div>
    <div class="m-id" style="margin-top:4px">${esc(m.model)}</div>
-   <div class="mini-kpi"><div class="mk"><div class="mkv" style="color:var(--green)">${s?num(m.rpm):'—'}</div><div class="mkl">req/min</div></div><div class="mk"><div class="mkv">${s?ms(m.p95):'—'}</div><div class="mkl">p95</div></div><div class="mk"><div class="mkv">$${(m.costHr||0).toFixed(2)}</div><div class="mkl">$/hr</div></div></div>
+   <div class="mini-kpi"><div class="mk"><div class="mkv" style="color:var(--green)">${s?num(m.rpm):'—'}</div><div class="mkl">req/min</div></div><div class="mk"><div class="mkv">${s?ms(m.p95):'—'}</div><div class="mkl">p95</div></div><div class="mk"><div class="mkv">$${(m.costHr||0).toFixed(2)}</div><div class="mkl">$/hr</div></div><div class="mk"><div class="mkv">${m.tokPerDollar!=null?num(m.tokPerDollar):'—'}</div><div class="mkl">tok/$</div></div></div>
    <div class="sec-title">Configuration</div>
    <div class="kv"><span class="k">Serving tier</span><span class="v">${tierLabel(m.tier)}</span><span class="k">GPU</span><span class="v">${esc(m.gpu)}</span>${(m.scale&&m.scale.length)?'':(m.prefillReplicas!=null?`<span class="k">Prefill / Decode</span><span class="v">${m.prefillReplicas} / ${m.decodeReplicas} replicas</span>`:(m.replicas!=null?`<span class="k">Replicas</span><span class="v">${m.availableReplicas||0} / ${m.replicas} ready</span>`:''))}${m.router?`<span class="k">llm-d router</span><span class="v">${esc(m.router)}</span>`:''}${s?`<span class="k">Error rate</span><span class="v">${m.errPct==null?'—':m.errPct+'%'}</span><span class="k">Tokens/s</span><span class="v">${num(m.tps)}</span>`:''}${m.health?`<span class="k">Health</span><span class="v">${esc(m.health)}</span>`:''}</div>
    ${scaleHTML(m)}

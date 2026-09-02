@@ -1,0 +1,144 @@
+# EKS managed-addon freshness — weekly, REPORT-ONLY.
+#
+# Why: Terraform declares `most_recent = true` for every EKS managed addon
+# (terraform/30.eks/30.cluster), so `terraform apply` converges them to latest —
+# but drift accrues *between* applies. That is exactly how aws-ebs-csi-driver once
+# sat on a vulnerable pinned version until an image scan caught it. This workflow
+# runs weekly and turns that drift into a GitHub issue so an operator applies the
+# update deliberately.
+#
+# REPORT-ONLY, by design: it reads the EKS Addons API and (if anything is behind)
+# opens/updates a GitHub issue. It NEVER runs `update-addon` and never touches the
+# cluster. The remediation commands are printed in the issue for a human to run.
+#
+# SCOPE — EKS MANAGED ADDONS ONLY. The detector talks to the EKS Addons API, which
+# cannot see Helm-/manifest-managed OSS components (LiteLLM, Open WebUI, Langfuse,
+# Karpenter, KEDA, …). Those are intentionally operator-pinned and are never in
+# scope here.
+#
+# ENABLING (opt-in — this is a sample many forks deploy differently). Set three
+# repository *variables* (Settings → Secrets and variables → Actions → Variables):
+#   ADDON_RECONCILER_ROLE_ARN  — an IAM role this repo can assume via GitHub OIDC,
+#                                with read-only EKS perms: eks:DescribeCluster,
+#                                eks:ListAddons, eks:DescribeAddon,
+#                                eks:DescribeAddonVersions.
+#   ADDON_RECONCILER_CLUSTER   — the EKS cluster name (e.g. ai-platform-prod).
+#   ADDON_RECONCILER_REGION    — the cluster's region (e.g. us-east-1).
+# Until all three are set, the job runs green and simply skips (a notice explains).
+name: addon-freshness
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # Mondays 08:00 UTC — weekly
+  workflow_dispatch: {}
+
+# Read-only to the repo; may open issues; OIDC token to assume the AWS read role.
+permissions:
+  contents: read
+  issues: write
+  id-token: write
+
+concurrency:
+  group: addon-freshness
+  cancel-in-progress: false
+
+jobs:
+  report:
+    name: detect drift + report (read-only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check configuration (skip cleanly if unset)
+        id: cfg
+        env:
+          ROLE: ${{ vars.ADDON_RECONCILER_ROLE_ARN }}
+          CLUSTER: ${{ vars.ADDON_RECONCILER_CLUSTER }}
+          REGION: ${{ vars.ADDON_RECONCILER_REGION }}
+        run: |
+          if [ -z "$ROLE" ] || [ -z "$CLUSTER" ] || [ -z "$REGION" ]; then
+            echo "::notice::addon-freshness not configured — set repo variables ADDON_RECONCILER_ROLE_ARN, ADDON_RECONCILER_CLUSTER and ADDON_RECONCILER_REGION to enable. Skipping."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.cfg.outputs.configured == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install boto3
+        if: steps.cfg.outputs.configured == 'true'
+        run: pip install --quiet boto3
+
+      - name: Configure AWS credentials (OIDC → read-only role)
+        if: steps.cfg.outputs.configured == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.ADDON_RECONCILER_ROLE_ARN }}
+          aws-region: ${{ vars.ADDON_RECONCILER_REGION }}
+
+      - name: Detect drift (report-only — never mutates the cluster)
+        id: detect
+        if: steps.cfg.outputs.configured == 'true'
+        env:
+          CLUSTER: ${{ vars.ADDON_RECONCILER_CLUSTER }}
+          REGION: ${{ vars.ADDON_RECONCILER_REGION }}
+        run: |
+          set -euo pipefail
+          python3 ops/lib/addon_freshness.py --cluster "$CLUSTER" --region "$REGION" --format json > report.json
+          drift=$(python3 - <<'PY'
+          import json, sys
+          sys.path.insert(0, "ops/lib")
+          import addon_freshness as af
+          rep = json.load(open("report.json"))
+          open("report.md", "w").write(af.render_markdown(rep))
+          print(rep["driftCount"])
+          PY
+          )
+          echo "drift=$drift" >> "$GITHUB_OUTPUT"
+          {
+            echo "## EKS managed-addon freshness";
+            cat report.md;
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open / update / close the drift issue
+        if: steps.cfg.outputs.configured == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const drift = Number('${{ steps.detect.outputs.drift }}' || '0');
+            const label = 'addon-freshness';
+            const title = 'EKS managed-addon freshness';
+            const body = fs.existsSync('report.md') ? fs.readFileSync('report.md', 'utf8') : 'No report generated.';
+            const stamp = `\n\n<sub>Updated ${new Date().toISOString()} · run ${context.runId}</sub>`;
+
+            // Ensure the label exists (best-effort — don't fail the run on this).
+            try { await github.rest.issues.getLabel({ ...context.repo, name: label }); }
+            catch (e) {
+              try { await github.rest.issues.createLabel({ ...context.repo, name: label, color: 'fbca04', description: 'Weekly EKS managed-addon freshness report' }); }
+              catch (e2) {}
+            }
+
+            const existing = (await github.rest.issues.listForRepo({ ...context.repo, state: 'open', labels: label })).data;
+
+            if (drift > 0) {
+              if (existing.length) {
+                const n = existing[0].number;
+                await github.rest.issues.update({ ...context.repo, issue_number: n, title, body: body + stamp });
+                await github.rest.issues.createComment({ ...context.repo, issue_number: n, body: `🔄 Re-checked: **${drift}** managed addon(s) still behind latest.` });
+                core.notice(`Updated issue #${n} — ${drift} addon(s) behind.`);
+              } else {
+                const created = await github.rest.issues.create({ ...context.repo, title, body: body + stamp, labels: [label] });
+                core.notice(`Opened issue #${created.data.number} — ${drift} addon(s) behind.`);
+              }
+            } else {
+              for (const iss of existing) {
+                await github.rest.issues.createComment({ ...context.repo, issue_number: iss.number, body: '✅ All managed addons are back on the latest available version. Closing.' });
+                await github.rest.issues.update({ ...context.repo, issue_number: iss.number, state: 'closed' });
+              }
+              core.notice('All managed addons current — no drift.');
+            }
