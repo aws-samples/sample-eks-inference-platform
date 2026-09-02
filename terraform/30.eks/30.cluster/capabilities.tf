@@ -32,6 +32,24 @@ resource "aws_iam_role" "capability" {
   tags               = local.tags
 }
 
+# IAM role trust policies propagate asynchronously. EKS `CreateCapability`
+# validates the provided role's trust policy at create time, so on a fresh role
+# it can race ahead of propagation and fail the first `up` with:
+#   InvalidParameterException: The trust policy for the provided role is invalid.
+#   The policy must include sts:AssumeRole and sts:TagSession ... capabilities.eks.amazonaws.com
+# The role IS correct — it just isn't visible to the capabilities service yet.
+# Wait for the roles to settle before creating the capabilities so `up` succeeds
+# on the first run (previously the fix was to just re-run `up`). 30s is a safe
+# margin for IAM propagation; raise it if you still see the error on a fresh apply.
+resource "time_sleep" "capability_role_propagation" {
+  count           = length(local.enabled_capabilities) > 0 ? 1 : 0
+  create_duration = "30s"
+  triggers = {
+    role_arns = join(",", [for r in aws_iam_role.capability : r.arn])
+  }
+  depends_on = [aws_iam_role.capability]
+}
+
 ################################################################################
 # EKS Managed Capabilities - ArgoCD (requires Identity Center config)
 ################################################################################
@@ -68,7 +86,7 @@ resource "aws_eks_capability" "argocd" {
     }
   }
 
-  depends_on = [module.eks]
+  depends_on = [module.eks, time_sleep.capability_role_propagation]
 }
 
 ################################################################################
@@ -87,7 +105,7 @@ resource "aws_eks_capability" "simple" {
   delete_propagation_policy = "RETAIN"
   tags                      = local.tags
 
-  depends_on = [module.eks]
+  depends_on = [module.eks, time_sleep.capability_role_propagation]
 }
 
 # KRO needs cluster-admin level access to create/manage arbitrary resources
