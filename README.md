@@ -92,12 +92,19 @@ tracing apply uniformly — including the optional **llm-d** scale tier
 - Enough **service quota** for the GPU instance types you plan to self-host on (not needed for the Bedrock-only path)
 - A **fork of this repo** that ArgoCD can read — its URL goes in `gitops_repo_url`
 
-**Configure** — copy `terraform/00.global/vars/example.tfvars` to `<env>.tfvars` and fill the `REPLACE` markers: your Identity Center ARN + **its region** (`argocd_idc_region`, may differ from `region`) + your **SSO user id** (`argocd_rbac_mappings`), `gitops_repo_url` (your fork), `region`, and a unique `resources_prefix`.
+**Configure** — copy `terraform/00.global/vars/example.tfvars` to `<env>.tfvars` and fill the `REPLACE` markers: your Identity Center ARN + **its region** (`argocd_idc_region`, may differ from `region`) + your **SSO user id** (`argocd_rbac_mappings`), `gitops_repo_url` (your fork), `region`, a unique `resources_prefix`, and `cluster_endpoint_public_access_cidrs` (your operator IP/CIDR — **required**, see below).
 
 > Keep `private_eks_cluster = false` (the default). A private-only cluster's API is
 > reachable only from inside the VPC, so `./platformctl up` from a laptop can't
 > provision it — the Kubernetes resources time out on the private endpoint. Only
 > set it `true` if you run Terraform from an in-VPC host (bastion / CloudShell-in-VPC / VPN).
+
+> **Required with `private_eks_cluster = false`:** set `cluster_endpoint_public_access_cidrs`
+> to the public egress IP/CIDR(s) you run `platformctl`/`kubectl` from (e.g.
+> `["203.0.113.10/32"]` — find yours with `curl -s https://checkip.amazonaws.com`).
+> A plan-time check **fails closed** if this is empty or `0.0.0.0/0`, so the public
+> API endpoint is never left open to the internet. Add office/VPN/CI ranges as
+> needed; if your egress IP changes later, update this and re-run `./platformctl up`.
 
 ## Quick start
 
