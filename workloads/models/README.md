@@ -13,8 +13,9 @@ the models inside it deploy into:
 - `workloads/models/inference/` — platform-shared models (the `inference` namespace).
 - `workloads/models/team-<name>/` — a team's models, landing in that team's
   quota'd, RBAC'd namespace with its scoped API key. **Onboard the team first**:
-  add an `AITeam` in `workloads/teams/` (it creates the `team-<name>` namespace
-  with a GPU quota + scoped LiteLLM key), then the team drops model YAMLs here.
+  add an `AITeam` in `workloads/teams/` (scaffold it with `./platformctl
+  onboard-team <name>`) — it creates the `team-<name>` namespace
+  with a GPU quota + scoped LiteLLM key, then the team drops model YAMLs here.
   Models never create namespaces — so a stray commit can't spin up an unquota'd
   one; if the namespace doesn't exist yet, the app simply waits.
 

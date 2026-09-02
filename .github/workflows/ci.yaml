@@ -58,6 +58,26 @@ jobs:
           # Report only — style drift shouldn't block a platform PR, but surface it.
           ruff check --output-format=github ops/ platform/ || true
 
+  tests:
+    name: pytest (unit tests + guards)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install test deps
+        # boto3: sweep_env and recommend_instance.cli import it at module load;
+        # pyyaml: used by test_render. backend.py / addon_freshness.py guard or
+        # lazy-load their heavy deps (psycopg, jwt, boto3), so the suite imports
+        # cleanly with just these two. No cloud credentials — pure static tests.
+        run: pip install --quiet pytest==8.3.3 pyyaml==6.0.2 boto3
+      - name: pytest
+        # Blocks merge on any failing unit test — including the EKS managed-addon
+        # freshness guard (tests/test_addon_freshness.py), which fails if an addon
+        # is declared with neither most_recent nor an explicit addon_version.
+        run: python3 -m pytest -q
+
   shell:
     name: shellcheck
     runs-on: ubuntu-latest
