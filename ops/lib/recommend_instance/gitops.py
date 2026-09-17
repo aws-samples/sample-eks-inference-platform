@@ -17,6 +17,7 @@ skipped the prune. A manual sync has no such restriction.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -189,33 +190,36 @@ def _ensure_hf_token_secret(namespace: str, token: str, root: str, C: type) -> N
     serving pod reads via `secretKeyRef` (env HF_TOKEN). Without it the pod pulls
     HuggingFace unauthenticated (rate-limited/slow, and gated models fail).
 
-    Deliberately imperative and idempotent (`create --dry-run=client | apply`):
-    the secret is a credential and must NOT be committed to git, so it lives
-    outside the GitOps flow. Best-effort — a failure here does not undo the push
-    (git remains the source of truth); we print a manual fallback.
-
-    Note: the token is passed on the kubectl argv (visible briefly in `ps`),
-    which is the standard kubectl secret-creation tradeoff."""
+    The secret is a credential and must NOT be committed to git, so it lives
+    outside the GitOps flow. We build the Secret manifest IN-PROCESS (the token is
+    base64-encoded in memory) and pipe it to `kubectl apply -f -`, so the token
+    never appears on any argv — it would otherwise be readable in
+    /proc/<pid>/cmdline by a co-tenant on a shared operator/CI host and could leak
+    into shell history or CI logs. Idempotent (apply creates or updates).
+    Best-effort — a failure here does not undo the push (git remains the source of
+    truth); we print a manual fallback."""
+    manual = (f'  printf %s "$HF_TOKEN" | kubectl create secret generic hf-token '
+              f'-n {namespace} --from-file=token=/dev/stdin')
     if shutil.which("kubectl") is None:
         print(f"{C.YELLOW}kubectl not found{C.RESET} — could not create the hf-token "
-              f"secret; the pod will pull HuggingFace unauthenticated. Create it with:\n"
-              f"  kubectl create secret generic hf-token -n {namespace} "
-              f"--from-literal=token=YOUR_TOKEN")
+              f"secret; the pod will pull HuggingFace unauthenticated. Create it with:\n{manual}")
         return
-    gen = _run(["kubectl", "create", "secret", "generic", "hf-token",
-                "-n", namespace, "--from-literal=token=" + token,
-                "--dry-run=client", "-o", "yaml"], cwd=root)
-    if gen.returncode != 0:
-        print(f"{C.YELLOW}Could not render the hf-token secret{C.RESET} "
-              f"({gen.stderr.strip() or 'kubectl failed'}).")
-        return
+    # Manifest built here (not via `kubectl create secret --from-literal`, which
+    # puts the token on argv). base64(data) is the Secret wire format; apply reads
+    # it from stdin only.
+    manifest = json.dumps({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": "hf-token", "namespace": namespace},
+        "type": "Opaque",
+        "data": {"token": base64.b64encode(token.encode()).decode()},
+    })
     apply = subprocess.run(["kubectl", "apply", "-n", namespace, "-f", "-"],
-                           input=gen.stdout, capture_output=True, text=True, cwd=root)
+                           input=manifest, capture_output=True, text=True, cwd=root)
     if apply.returncode != 0:
         print(f"{C.YELLOW}Could not apply the hf-token secret{C.RESET} "
               f"({apply.stderr.strip() or 'kubectl failed'}).")
-        print(f"{C.DIM}Create it manually: kubectl create secret generic hf-token "
-              f"-n {namespace} --from-literal=token=YOUR_TOKEN{C.RESET}")
+        print(f"{C.DIM}Create it manually:\n{manual}{C.RESET}")
         return
     print(f"{C.GREEN}✓ hf-token secret ensured{C.RESET} in namespace '{namespace}' — "
           f"the pod authenticates to HuggingFace. (An already-running pod must be "
