@@ -179,32 +179,26 @@ metadata:
 data:
   config.yaml: |
     # Two model sources merge at runtime:
-    #   1. Static models declared here (committed to git) — e.g. Bedrock, which
-    #      has nothing to deploy/scale, so it needs no serving CR.
-    #   2. Self-hosted models registered dynamically via the LiteLLM API
-    #      (POST /model/new) by the litellm-sync controller, which watches the
-    #      serving-tier CRs (VLLMEndpoint/LLMDEndpoint/LLMDDisaggEndpoint) and
+    #   1. Static models declared here (committed to git). None by default — see
+    #      the note on model_list below.
+    #   2. Models registered dynamically via the LiteLLM API (POST /model/new) by
+    #      the litellm-sync controller, which watches the serving-tier CRs
+    #      (VLLMEndpoint/LLMDEndpoint/LLMDDisaggEndpoint) AND BedrockModels and
     #      registers/deregisters each model centrally.
     # LiteLLM merges this model_list with DB-registered models (STORE_MODEL_IN_DB=True).
-    model_list:
-      # Amazon Bedrock — Amazon Nova Lite. Static endpoint: zero GPUs, no serving
-      # CR. Auth comes from the `litellm` ServiceAccount's IRSA role (terraform:
-      # enable_bedrock=true) — no static keys. Uses the direct foundation-model ID
-      # (no global./eu./us. cross-region inference profile — those don't apply in
-      # the single-region ESC partition). Requires Bedrock model access enabled
-      # for this model in the ESC console (one-time toggle) —
-      # `./platformctl status --check` validates it.
-      - model_name: nova-lite
-        litellm_params:
-          model: bedrock/eu.amazon.nova-lite-v1:0 #ESC: bedrock/amazon.nova-lite-v1:0
-          aws_region_name: os.environ/AWS_REGION
-          # Bedrock runtime endpoint, injected from the Terraform litellm-env
-          # ConfigMap (AWS_ENDPOINT_URL_BEDROCK_RUNTIME) so this file stays
-          # partition-agnostic. ESC needs the sovereign amazonaws.eu host (the
-          # default bedrock-runtime.<region>.amazonaws.com doesn't exist in the
-          # aws-eusc partition); commercial regions get the .com host. Terraform
-          # sets it for both — see terraform/30.eks/30.cluster/bedrock.tf.
-          aws_bedrock_runtime_endpoint: os.environ/AWS_ENDPOINT_URL_BEDROCK_RUNTIME
+    #
+    # No models are shipped by default — including Bedrock. Both self-hosted
+    # models AND Amazon Bedrock models are enrolled self-service and registered
+    # dynamically by litellm-sync (source #2 above):
+    #   - self-hosted: ./platformctl new-model <hf-id> --deploy   (VLLMEndpoint/…)
+    #   - Bedrock:     ./platformctl new-model --source bedrock <model> --deploy
+    #                  (a BedrockModel CR; litellm-sync registers bedrock/<id>
+    #                   with the region/partition-correct invocation id + price)
+    # This keeps the committed config partition-agnostic: nothing here names a
+    # region- or partition-specific model id that would be wrong in another
+    # region or in the ESC partition. See platform/config/bedrockmodel-crd.yaml
+    # and workloads/models/README.md.
+    model_list: []
     litellm_settings:
       # Register the Langfuse callback HERE — this is the only place LiteLLM
       # reads it. (There is no LITELLM_CALLBACKS env var; setting one is a no-op.)

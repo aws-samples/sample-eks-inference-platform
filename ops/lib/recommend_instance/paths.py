@@ -26,6 +26,9 @@ KIND_DIR = {
     "VLLMEndpoint": f"{MODELS_ROOT}/inference",
     "LLMDEndpoint": SCALE_MODELS_DIR,
     "LLMDDisaggEndpoint": SCALE_MODELS_DIR,
+    # Bedrock models (no GPU/infra) live alongside the vLLM models; the recursive
+    # find_model_files() search below makes `--undeploy <name>` work for them too.
+    "BedrockModel": f"{MODELS_ROOT}/inference",
 }
 
 # A model name doubles as a Kubernetes object name, so it must be an RFC 1123

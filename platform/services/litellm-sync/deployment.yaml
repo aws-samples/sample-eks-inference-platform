@@ -1,6 +1,6 @@
 # litellm-sync controller.
 #
-# Long-running pod that watches the three serving-tier CRs cluster-wide
+# Long-running pod that watches the serving-tier CRs and BedrockModels cluster-wide
 # (VLLMEndpoint / LLMDEndpoint / LLMDDisaggEndpoint) and is the sole owner of
 # LiteLLM's model registry — registering a model on create and deregistering it
 # on delete via a finalizer (see scripts/litellm_sync.py). This keeps the LiteLLM
