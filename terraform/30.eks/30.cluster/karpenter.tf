@@ -46,6 +46,23 @@ resource "aws_iam_role" "karpenter_node" {
   tags               = local.tags
 }
 
+# POLICY PARITY (commercial + ESC) — because the node role is created here rather
+# than by the karpenter module (create_node_iam_role = false, for the ESC trust
+# principal), this attachment set MUST remain a SUPERSET of what the module
+# attaches to its own node role, or Karpenter-launched nodes on the commercial
+# (majority) path could fail to join or lose SSM/ECR access. As of
+# terraform-aws-modules/eks//modules/karpenter v21.1.5 the module's node-role base
+# set is: AmazonEKSWorkerNodePolicy, AmazonEKS_CNI_Policy (ipv4),
+# AmazonEC2ContainerRegistryReadOnly. Below we attach exactly those three PLUS
+# AmazonSSMManagedInstanceCore (node SSM access) and, when the ECR pull-through
+# cache is enabled, the import policy — so this is a strict superset.
+# No instance profile is needed here: the module's create_instance_profile
+# defaults false (we don't enable it), so Karpenter 1.x creates the instance
+# profile at runtime from the EC2NodeClass spec.role (= this role's name, wired
+# below and at the karpenter_manifests `role` var); the module's controller policy
+# scopes iam:PassRole and the EKS access entry to node_iam_role_arn (this role).
+# RE-VERIFY the base set above whenever the karpenter module version is bumped, so
+# a module change can't silently drop a node policy this hand-rolled role omits.
 resource "aws_iam_role_policy_attachment" "karpenter_node" {
   for_each = local.capabilities.autoscaling ? merge(
     {
