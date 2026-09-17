@@ -60,3 +60,45 @@ class TestEmittedManifestShape:
         doc = list(yaml.safe_load_all(body))[0]
         assert doc["spec"]["model"] == mid
         assert doc["metadata"]["name"] == "llama-3-1-8b-instruct"
+
+
+class TestYamlScalarQuoting:
+    """`--extra-arg` tokens are user-supplied and interpolated into a manifest
+    that `--deploy` commits and ArgoCD applies. `_yaml_scalar` must emit a YAML
+    scalar that round-trips to the EXACT input, with no way to alter surrounding
+    manifest structure. These tokens broke the previous hand-rolled quoting."""
+
+    ADVERSARIAL = [
+        "--enable-prefix-caching",   # plain
+        "qwen3",
+        'j{"k":"v"}',                # embedded double quotes (JSON payload)
+        "it's",                      # single quote
+        "both'\"quotes",             # both quote styles present
+        "trailing\\",                # trailing backslash -> old code escaped the closing quote
+        "x'y\\",                     # single quote + trailing backslash -> old parse error
+        "a\\tc",                     # literal backslash-t -> must NOT decode to a TAB
+        "a\\0b",                     # backslash-zero
+        "a\\x41b",                   # backslash-x escape sequence
+        "a\\u0041b",                 # backslash-u escape sequence
+        "--kv=a\tb",                 # a real TAB character in the token
+        "café",                      # non-ASCII
+    ]
+
+    @pytest.mark.parametrize("tok", ADVERSARIAL)
+    def test_round_trips_exactly(self, tok):
+        emitted = render._yaml_scalar(tok)
+        # Exactly one key, value byte-identical to the input.
+        assert yaml.safe_load("v: " + emitted) == {"v": tok}
+
+    @pytest.mark.parametrize("bad", ["a\nb", "a\rb", "\n", 'x"\nowned: yes'])
+    def test_rejects_newlines(self, bad):
+        # A newline is the only way to inject an adjacent mapping key; it's
+        # rejected up front rather than emitted.
+        with pytest.raises(SystemExit):
+            render._yaml_scalar(bad)
+
+    def test_full_extraargs_fragment_round_trips(self):
+        # Mirror how build_endpoint_yaml emits the list, then parse the fragment.
+        tokens = ["--reasoning-parser", "qwen3", 'cfg={"a":"b\\t"}', "trailing\\"]
+        fragment = "\n".join(["extraArgs:"] + [f"  - {render._yaml_scalar(t)}" for t in tokens])
+        assert yaml.safe_load(fragment) == {"extraArgs": tokens}

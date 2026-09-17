@@ -1002,19 +1002,26 @@ def _valid_quantity(value: str, flag: str) -> str:
 
 
 def _yaml_scalar(v: str) -> str:
-    """Quote an arbitrary extraArgs token safely for YAML. Handles values that
-    contain double quotes (e.g. JSON like {\"method\":\"mtp\"}) by using single
-    quotes; rejects newlines to prevent manifest injection."""
+    """Quote an arbitrary extraArgs token safely for YAML.
+
+    YAML is a strict superset of JSON, so a ``json.dumps`` string is always a
+    valid YAML double-quoted scalar that decodes back to exactly ``v``. We
+    delegate to the stdlib JSON encoder so every escape hazard (backslashes,
+    both quote styles, \\t / \\0 / control chars, \\uXXXX, non-ASCII) is handled
+    by a tested library rather than hand-rolled quoting.
+
+    This matters because the token is user-supplied via ``--extra-arg`` and
+    interpolated into a manifest that ``--deploy`` commits and ArgoCD applies:
+    the previous hand-rolled logic left backslashes unescaped in its
+    single-quote and no-quote branches, so a token ending in ``\\`` escaped the
+    closing quote (unterminated scalar -> broken manifest) and a token like
+    ``a\\tc`` was silently reinterpreted (``\\t`` -> TAB). ``json.dumps``
+    (ensure_ascii=True) emits only escapes YAML also understands, so the round
+    trip is exact. Newlines are still rejected up front as an input-sanity guard
+    (a newline in a `vllm serve` arg is almost certainly a mistake)."""
     if "\n" in v or "\r" in v:
         sys.exit(f"error: --extra-arg value must not contain newlines: {v!r}")
-    if '"' in v and "'" not in v:
-        return f"'{v}'"
-    if "'" in v and '"' not in v:
-        return f'"{v}"'
-    if '"' not in v and "'" not in v:
-        return f'"{v}"'
-    # Both quote styles present — escape within a double-quoted scalar.
-    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return json.dumps(v)
 
 
 def _expand_extra_args(raw: list) -> list[str]:
