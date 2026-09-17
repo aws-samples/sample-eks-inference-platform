@@ -1,6 +1,7 @@
 locals {
   cluster_name    = "${var.shared_config.resources_prefix}-${terraform.workspace}"
   region          = data.aws_region.current.id
+  partition       = data.aws_partition.current.partition
   tfstate_region  = try(var.tfstate_region, local.region)
   cluster_version = var.cluster_config.kubernetes_version
   eks_auto_mode   = try(var.cluster_config.eks_auto_mode, false)
@@ -23,6 +24,10 @@ locals {
   private_subnet_ids       = data.terraform_remote_state.vpc.outputs.private_subnet_ids
   control_plane_subnet_ids = try(var.cluster_config.use_intra_subnets, true) ? data.terraform_remote_state.vpc.outputs.intra_subnet_ids : local.private_subnet_ids
 
+  # Resolved once so kro can default to it (the gitops workloads layer needs KRO)
+  # without a self-reference inside the capabilities map below.
+  gitops_enabled = try(var.cluster_config.capabilities.gitops, true)
+
   capabilities = {
     kube_proxy   = try(var.cluster_config.capabilities.kube_proxy, !local.eks_auto_mode, true)
     networking   = try(var.cluster_config.capabilities.networking, !local.eks_auto_mode, true)
@@ -30,11 +35,26 @@ locals {
     identity     = try(var.cluster_config.capabilities.identity, !local.eks_auto_mode, true)
     autoscaling  = try(var.cluster_config.capabilities.autoscaling, !local.eks_auto_mode, true)
     blockstorage = try(var.cluster_config.capabilities.blockstorage, !local.eks_auto_mode, true)
-    # EKS Managed Capabilities (AWS-managed, not self-managed)
-    gitops = try(var.cluster_config.capabilities.gitops, false)
-    kro    = try(var.cluster_config.capabilities.kro, false)
+    # EKS Managed Capabilities (AWS-managed, not self-managed).
+    # gitops defaults TRUE (ArgoCD app-of-apps — the platform layer). kro defaults
+    # to whatever gitops is: the gitops WORKLOADS layer (VLLMEndpoint / LLMDEndpoint
+    # / LLMDDisaggEndpoint / AITeam) are KRO ResourceGraphDefinitions, so a gitops
+    # platform can't serve self-hosted models or onboard teams without KRO. Still
+    # explicitly overridable (e.g. kro = false for a Bedrock-only gitops install).
+    # ack defaults false (optional, unused by this solution).
+    gitops = local.gitops_enabled
+    kro    = try(var.cluster_config.capabilities.kro, local.gitops_enabled)
     ack    = try(var.cluster_config.capabilities.ack, false)
   }
+
+  # Whether to provision the AWS-managed EKS Capabilities (aws_eks_capability.*).
+  # ESC (eusc-de-east-1) has NO Managed Capabilities (EKS CreateCapability is
+  # absent there), so set cluster_config.capabilities.eks_capabilities = false and
+  # self-install ArgoCD/KRO via Helm. This flag ONLY gates the aws_eks_capability.*
+  # resources (and their IAM role/trust/access-associations/cluster-secret/bootstrap);
+  # the gitops/kro/ack flags above still gate the platform SUPPORT resources
+  # (namespaces, IRSA, secrets, ConfigMaps, buckets). Defaults true (managed).
+  use_managed_capabilities = try(var.cluster_config.capabilities.eks_capabilities, true)
 
   create_mng_system = try(var.cluster_config.create_mng_system, !local.eks_auto_mode, true)
 

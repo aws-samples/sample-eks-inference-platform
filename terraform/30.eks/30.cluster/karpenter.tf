@@ -1,6 +1,10 @@
-data "aws_ecrpublic_authorization_token" "token" {
-  provider = aws.virginia
-}
+# NOTE (ESC): ECR Public is a commercial us-east-1-only service, so
+# aws_ecrpublic_authorization_token authenticated with aws-eusc credentials fails
+# with InvalidClientTokenId. The Karpenter chart and controller image are pulled
+# anonymously from public.ecr.aws over NAT egress instead (public.ecr.aws issues an
+# anonymous bearer token; Helm and containerd perform that token flow automatically).
+# To avoid internet egress entirely, mirror both into a private ECR repo in
+# eusc-de-east-1 and repoint repository / controller.image below.
 
 # Add the Karpenter discovery tag only to the cluster primary security group
 # by default if using the eks module tags, it will tag all resources with this tag, which is not needed.
@@ -9,6 +13,52 @@ resource "aws_ec2_tag" "cluster_primary_security_group" {
   resource_id = module.eks.cluster_primary_security_group_id
   key         = "karpenter.sh/discovery"
   value       = local.cluster_name
+}
+
+################################################################################
+# Karpenter node IAM role (ESC override)
+#
+# The terraform-aws-modules/karpenter module builds the node role's trust
+# principal as ec2.${data.aws_partition.current.dns_suffix}. In aws-eusc the
+# partition dns_suffix is "amazonaws.eu", yielding "ec2.amazonaws.eu", which the
+# ESC IAM service rejects ("Invalid principal in policy"). ESC uses the standard
+# "ec2.amazonaws.com" principal (as module.eks's own managed node group role
+# does). The module exposes no override for this principal, so we create the
+# node role here with the correct principal and hand it to the module via
+# create_node_iam_role = false + node_iam_role_arn.
+################################################################################
+data "aws_iam_policy_document" "karpenter_node_assume" {
+  count = local.capabilities.autoscaling ? 1 : 0
+
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["ec2.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "karpenter_node" {
+  count              = local.capabilities.autoscaling ? 1 : 0
+  name               = "KarpenterNode-${module.eks.cluster_name}"
+  assume_role_policy = data.aws_iam_policy_document.karpenter_node_assume[0].json
+  tags               = local.tags
+}
+
+resource "aws_iam_role_policy_attachment" "karpenter_node" {
+  for_each = local.capabilities.autoscaling ? merge(
+    {
+      worker = "arn:${local.partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+      cni    = "arn:${local.partition}:iam::aws:policy/AmazonEKS_CNI_Policy"
+      ecr    = "arn:${local.partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+      ssm    = "arn:${local.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+    },
+    var.docker_hub_username != "" ? { ecrpull = aws_iam_policy.ecr_pull_through[0].arn } : {}
+  ) : {}
+
+  role       = aws_iam_role.karpenter_node[0].name
+  policy_arn = each.value
 }
 
 ################################################################################
@@ -53,18 +103,13 @@ module "karpenter" {
   ]
 
   # Used to attach additional IAM policies to the Karpenter node IAM role.
-  # The ECR pull-through import policy is attached only when the docker-hub
-  # pull-through cache is enabled — GPU nodes pull the vLLM serving image from
-  # the cache at runtime, and the FIRST pull must import the upstream image (403s with the
-  # default read-only node policy otherwise → ImagePullBackOff).
-  node_iam_role_additional_policies = merge(
-    {
-      AmazonSSMManagedInstanceCore = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
-    },
-    var.docker_hub_username != "" ? {
-      EcrPullThroughImport = aws_iam_policy.ecr_pull_through[0].arn
-    } : {},
-  )
+  # ESC: the node role is created outside this module (see aws_iam_role.karpenter_node)
+  # so its trust principal is ec2.amazonaws.com rather than the module's
+  # ec2.${dns_suffix} = ec2.amazonaws.eu (rejected by ESC IAM). All node policies
+  # — including AmazonSSMManagedInstanceCore and the optional ECR pull-through
+  # import policy — are attached there via aws_iam_role_policy_attachment.karpenter_node.
+  create_node_iam_role = false
+  node_iam_role_arn    = one(aws_iam_role.karpenter_node[*].arn)
 
   iam_role_name            = "KarpenterController-${module.eks.cluster_name}"
   iam_role_use_name_prefix = false
@@ -85,12 +130,10 @@ module "karpenter" {
 resource "helm_release" "karpenter" {
   count = local.capabilities.autoscaling ? 1 : 0
 
-  namespace           = "kube-system"
-  name                = "karpenter"
-  repository          = "oci://public.ecr.aws/karpenter"
-  repository_username = data.aws_ecrpublic_authorization_token.token.user_name
-  repository_password = data.aws_ecrpublic_authorization_token.token.password
-  chart               = "karpenter"
+  namespace  = "kube-system"
+  name       = "karpenter"
+  repository = "oci://public.ecr.aws/karpenter"
+  chart      = "karpenter"
   # NOTE (CRDs): Helm does NOT upgrade CRDs bundled under the chart's `crds/`
   # directory on `helm upgrade` — it only installs them on first `helm install`.
   # Karpenter v1.14 moves the CapacityBuffer CRD to apiVersion v1beta1, so an
@@ -171,7 +214,7 @@ data "kubectl_path_documents" "karpenter_manifests" {
   count   = (local.capabilities.autoscaling || local.eks_auto_mode) ? 1 : 0
   pattern = "${path.module}/karpenter/*.yaml"
   vars = {
-    role         = local.capabilities.autoscaling ? module.karpenter.node_iam_role_name : "KarpenterNodeInstanceProfile-${local.cluster_name}"
+    role         = local.capabilities.autoscaling ? aws_iam_role.karpenter_node[0].name : "KarpenterNodeInstanceProfile-${local.cluster_name}"
     cluster_name = local.cluster_name
     environment  = terraform.workspace
     # Renders as a complete YAML line when set, or empty string when not.

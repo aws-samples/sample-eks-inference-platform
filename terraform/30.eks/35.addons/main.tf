@@ -18,7 +18,7 @@ data "aws_iam_policy_document" "lbc_v3_supplement" {
 
 module "eks_blueprints_addons" {
   source  = "aws-ia/eks-blueprints-addons/aws"
-  version = "~> 1.21.0"
+  version = "~> 1.24.0"
 
   cluster_name      = data.terraform_remote_state.eks.outputs.cluster_name
   cluster_endpoint  = data.terraform_remote_state.eks.outputs.cluster_endpoint

@@ -31,6 +31,15 @@ spec:
       pipelineParallelSize: "integer | default=1"
       shared:               "boolean | default=false"
       replicas:             "integer | default=1"
+      # Pin the exact EC2 instance type (e.g. "g6.2xlarge"). Empty (default) =
+      # let Karpenter pick cheapest-fit from the gpu-inference NodePool. Set it
+      # to OVERRIDE the recommender and stop Karpenter falling back to a larger,
+      # pricier node when the recommended size lacks capacity: with this set the
+      # pod pins to exactly this type (via a node.kubernetes.io/instance-type
+      # nodeSelector) and stays Pending if that type is unavailable, rather than
+      # silently landing on an 8-GPU box. Must be a type the gpu-inference
+      # NodePool is allowed to launch (and offered in your region).
+      instanceType:         "string"
       workerMemory:         "string  | default=12Gi"
       workerCpu:            "string  | default=4"
       maxModelLen:          "integer | default=8192"
@@ -129,8 +138,16 @@ spec:
                 karpenter.sh/do-not-disrupt: "true"
             spec:
               serviceAccountName: inference-worker
-              nodeSelector:
-                workload-type: "${schema.spec.shared ? 'gpu-shared' : 'gpu-inference'}"
+              # Base workload-type selector, plus an exact instance-type pin when
+              # spec.instanceType is set. Built as a CEL map (ternary over two map
+              # literals) so the node.kubernetes.io/instance-type key only appears
+              # when requested — same optional-append pattern as extraEnv/args.
+              # NOTE: single-quoted so YAML does not interpret the ':' inside the
+              # CEL map literals as nested mappings (unquoted fails to parse). The
+              # CEL uses only double quotes internally, so the single-quoted scalar
+              # preserves it verbatim; KRO still evaluates the whole-value ${...}
+              # expression to a map<string,string>.
+              nodeSelector: '${schema.spec.?instanceType.orValue("") != "" ? {"workload-type": (schema.spec.shared ? "gpu-shared" : "gpu-inference"), "node.kubernetes.io/instance-type": schema.spec.instanceType} : {"workload-type": (schema.spec.shared ? "gpu-shared" : "gpu-inference")}}'
               tolerations:
                 - key: nvidia.com/gpu
                   operator: Exists

@@ -153,7 +153,6 @@ clickhouse:
   persistence:
     enabled: true
     size: 50Gi
-    storageClass: gp3
   resources:
     requests:
       cpu: 500m
@@ -180,7 +179,6 @@ redis:
     persistence:
       enabled: true
       size: 8Gi
-      storageClass: gp3
 
 # MinIO (bundled S3-compatible blob storage for traces/events)
 s3:

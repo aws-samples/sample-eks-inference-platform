@@ -56,6 +56,26 @@ spec:
                   name: litellm-env
                   key: AWS_REGION
                   optional: true
+            # ESC: sovereign-partition STS endpoint for IRSA (AssumeRoleWithWebIdentity).
+            # Sourced from the same Terraform ConfigMap; optional:true so non-ESC
+            # installs (where the key is absent) fall back to default STS resolution.
+            - name: AWS_ENDPOINT_URL_STS
+              valueFrom:
+                configMapKeyRef:
+                  name: litellm-env
+                  key: AWS_ENDPOINT_URL_STS
+                  optional: true
+            # Bedrock runtime endpoint (referenced as os.environ/… by the Bedrock
+            # models below). Sourced from the same Terraform ConfigMap, which sets
+            # it for every partition (aws -> .amazonaws.com, aws-eusc ->
+            # .amazonaws.eu). optional:true keeps LiteLLM bootable on non-Terraform
+            # installs where the key is absent (Bedrock then uses its default URL).
+            - name: AWS_ENDPOINT_URL_BEDROCK_RUNTIME
+              valueFrom:
+                configMapKeyRef:
+                  name: litellm-env
+                  key: AWS_ENDPOINT_URL_BEDROCK_RUNTIME
+                  optional: true
             # Langfuse callback is enabled via litellm_settings.success_callback
             # in the config (not an env var). These provide the credentials it uses.
             - name: LANGFUSE_HOST
@@ -167,18 +187,24 @@ data:
     #      registers/deregisters each model centrally.
     # LiteLLM merges this model_list with DB-registered models (STORE_MODEL_IN_DB=True).
     model_list:
-      # Amazon Bedrock — Claude Opus 4.8 (the frontier commercial baseline).
-      # Static endpoint: zero GPUs, no serving CR. Auth comes from the
-      # `litellm` ServiceAccount's IRSA role (terraform: enable_bedrock=true) —
-      # no static keys. The `global.` prefix selects the region-agnostic
-      # cross-region inference profile (works in any region; swap to `eu.`/`us.`
-      # to pin a geography). Verify the exact model ID + region availability in
-      # the Bedrock console; it's a one-line edit. Requires Bedrock model access
-      # enabled in-account (a one-time console toggle) — `./platformctl status --check` validates it.
-      - model_name: claude-opus-4-8
+      # Amazon Bedrock — Amazon Nova Lite. Static endpoint: zero GPUs, no serving
+      # CR. Auth comes from the `litellm` ServiceAccount's IRSA role (terraform:
+      # enable_bedrock=true) — no static keys. Uses the direct foundation-model ID
+      # (no global./eu./us. cross-region inference profile — those don't apply in
+      # the single-region ESC partition). Requires Bedrock model access enabled
+      # for this model in the ESC console (one-time toggle) —
+      # `./platformctl status --check` validates it.
+      - model_name: nova-lite
         litellm_params:
-          model: bedrock/global.anthropic.claude-opus-4-8
+          model: bedrock/eu.amazon.nova-lite-v1:0 #ESC: bedrock/amazon.nova-lite-v1:0
           aws_region_name: os.environ/AWS_REGION
+          # Bedrock runtime endpoint, injected from the Terraform litellm-env
+          # ConfigMap (AWS_ENDPOINT_URL_BEDROCK_RUNTIME) so this file stays
+          # partition-agnostic. ESC needs the sovereign amazonaws.eu host (the
+          # default bedrock-runtime.<region>.amazonaws.com doesn't exist in the
+          # aws-eusc partition); commercial regions get the .com host. Terraform
+          # sets it for both — see terraform/30.eks/30.cluster/bedrock.tf.
+          aws_bedrock_runtime_endpoint: os.environ/AWS_ENDPOINT_URL_BEDROCK_RUNTIME
     litellm_settings:
       # Register the Langfuse callback HERE — this is the only place LiteLLM
       # reads it. (There is no LITELLM_CALLBACKS env var; setting one is a no-op.)

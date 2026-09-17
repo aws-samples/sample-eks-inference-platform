@@ -10,7 +10,7 @@ output "cluster_name" {
 
 output "argocd_url" {
   description = "ArgoCD UI URL (login with Identity Center)"
-  value       = local.capabilities.gitops ? aws_eks_capability.argocd[0].configuration[0].argo_cd[0].server_url : null
+  value       = try(aws_eks_capability.argocd[0].configuration[0].argo_cd[0].server_url, null)
 }
 
 output "next_steps" {

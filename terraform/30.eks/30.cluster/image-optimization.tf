@@ -210,7 +210,7 @@ resource "aws_iam_role_policy" "soci_builder_ecr" {
           "ecr:CompleteLayerUpload",
           "ecr:PutImage",
         ]
-        Resource = "arn:aws:ecr:${local.region}:${data.aws_caller_identity.current.account_id}:repository/docker-hub/*"
+        Resource = "arn:${local.partition}:ecr:${local.region}:${data.aws_caller_identity.current.account_id}:repository/docker-hub/*"
       },
       {
         # The SOCI builder is the apply-time FIRST puller of the vLLM image
@@ -222,7 +222,7 @@ resource "aws_iam_role_policy" "soci_builder_ecr" {
           "ecr:BatchImportUpstreamImage",
           "ecr:CreateRepository",
         ]
-        Resource = "arn:aws:ecr:${local.region}:${data.aws_caller_identity.current.account_id}:repository/docker-hub/*"
+        Resource = "arn:${local.partition}:ecr:${local.region}:${data.aws_caller_identity.current.account_id}:repository/docker-hub/*"
       },
     ]
   })
@@ -231,7 +231,7 @@ resource "aws_iam_role_policy" "soci_builder_ecr" {
 resource "aws_iam_role_policy_attachment" "soci_builder_ssm" {
   count      = local.need_soci_builder ? 1 : 0
   role       = aws_iam_role.soci_builder[0].name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  policy_arn = "arn:${local.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
 resource "aws_iam_instance_profile" "soci_builder" {

@@ -42,6 +42,14 @@ _MODEL_NAME = re.compile(r"\A[a-z0-9]([a-z0-9-]*[a-z0-9])?\Z")
 # manifest that gets committed and applied by ArgoCD (blocks YAML injection).
 _HF_MODEL_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
 
+# An EC2 instance type: `<family>.<size>` (e.g. g6.2xlarge, g4dn.xlarge,
+# p3dn.24xlarge). Family is a lowercase letter followed by letters/digits with
+# an optional hyphen suffix; size is letters/digits. Deliberately NO quotes,
+# spaces, or newlines, so a validated value is safe to interpolate into the YAML
+# manifest that `--deploy` commits and ArgoCD applies (blocks YAML injection).
+# Anchored with \A...\Z (not $, which also matches before a trailing newline).
+_INSTANCE_TYPE = re.compile(r"\A[a-z][a-z0-9]*(-[a-z0-9]+)?\.[a-z0-9]+\Z")
+
 
 def is_valid_model_name(name: str) -> bool:
     """True if `name` is a safe RFC 1123 label (and therefore path-traversal-safe)."""
@@ -51,6 +59,11 @@ def is_valid_model_name(name: str) -> bool:
 def is_valid_hf_model_id(model_id: str) -> bool:
     """True if `model_id` is a well-formed Hugging Face id safe to embed in YAML."""
     return bool(model_id) and len(model_id) <= 200 and _HF_MODEL_ID.match(model_id) is not None
+
+
+def is_valid_instance_type(instance_type: str) -> bool:
+    """True if `instance_type` is a well-formed EC2 instance type safe to embed in YAML."""
+    return bool(instance_type) and len(instance_type) <= 40 and _INSTANCE_TYPE.match(instance_type) is not None
 
 
 def find_model_files(root: str, name: str) -> list[str]:

@@ -79,7 +79,7 @@ locals {
   }
 
   cognito_domain_prefix = local.enable_sso ? "${local.cluster_name}-${random_string.cognito_domain_suffix[0].result}" : ""
-  cognito_issuer_url    = local.enable_sso ? "https://cognito-idp.${local.region}.amazonaws.com/${aws_cognito_user_pool.platform[0].id}" : ""
+  cognito_issuer_url    = local.enable_sso ? "https://cognito-idp.${local.region}.${data.aws_partition.current.dns_suffix}/${aws_cognito_user_pool.platform[0].id}" : ""
   cognito_hosted_ui_url = local.enable_sso ? "https://${aws_cognito_user_pool_domain.platform[0].domain}.auth.${local.region}.amazoncognito.com" : ""
 }
 

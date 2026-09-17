@@ -145,3 +145,9 @@ variable "region" {
   type        = string
   default     = null
 }
+
+variable "ack_service_controllers" {
+  description = "ACK controllers to self-install via Helm when eks_capabilities = false AND cluster_config.capabilities.ack = true (mirrors what the managed ACK capability would provide, gated on the same flag). Map of AWS service name (e.g. \"s3\", \"rds\", \"ec2\", \"iam\") to the IAM policy ARNs that controller needs (see each service's ACK 'recommended-policy-arn'). Each entry installs oci://public.ecr.aws/aws-controllers-k8s/<svc>-chart into the ack-system namespace with an IRSA role bound to its ack-<svc>-controller ServiceAccount. Empty map installs nothing (ack has no self-managed effect). Ignored when eks_capabilities = true."
+  type        = map(list(string))
+  default     = {}
+}

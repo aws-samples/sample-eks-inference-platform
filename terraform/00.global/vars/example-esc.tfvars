@@ -1,13 +1,8 @@
-# VPC CIDR for the platform network. The ALB frontend security group
-# (terraform/30.eks/30.cluster/alb-security-group.tf) derives its in-VPC allow
-# rules from this automatically, so the CloudFront edge + SSM tunnel keep working
-# whatever you set here — no manifest edits needed.
+# AWS European Sovereign Cloud
+
 vpc_cidr = "10.10.0.0/16"
 
-# AWS region to deploy this environment into. platformctl pins AWS_REGION from
-# this so Terraform, kubeconfig, and the CLI stay on the same region, and derives
-# the cluster name (<resources_prefix>-<env>) for use/status/tunnel.
-region = "us-east-1" # REPLACE with your region, e.g. eu-central-1
+region = "eusc-de-east-1"
 
 tags = {}
 
@@ -18,25 +13,16 @@ shared_config = {
 # Operator CIDR allowlist for the EKS PUBLIC API endpoint. REQUIRED whenever
 # private_eks_cluster = false (below): a plan-time check refuses to expose the
 # control plane to 0.0.0.0/0. Set this to the public egress IP/CIDR(s) you run
-# platformctl/kubectl from (office, VPN, CI).
+# platformctl/kubectl from (office, VPN, CI):
+# e.g. as given by https://www.whatismyip.com/
+
 cluster_endpoint_public_access_cidrs = ["<REPLACE>/32"]
 
 cluster_config = {
-  kubernetes_version = "1.36"
-  eks_auto_mode      = false
-
-  # private_eks_cluster false = public+private API endpoint (works with laptop provisioning — this is
-  # what ./platformctl up assumes). When false you MUST scope the public endpoint
-  # with cluster_endpoint_public_access_cidrs below (a plan-time check refuses an
-  # empty or 0.0.0.0/0 allowlist). true = PRIVATE-ONLY endpoint: the cluster API
-  # is reachable only from inside the VPC, so you must run Terraform/platformctl
-  # from a host in the VPC (bastion EC2, CloudShell-in-VPC, or over a VPN into the
-  # VPC) — a laptop over the public internet CANNOT provision it (the kubernetes/
-  # kubectl/helm resources will time out on the private endpoint). Leave false
-  # unless you have that in-VPC path.
+  kubernetes_version  = "1.36"
+  eks_auto_mode       = false
   private_eks_cluster = false
-
-  create_mng_system = true # Not required when using auto mode — runs Karpenter, CoreDNS, VPC CNI
+  create_mng_system   = true # Not required when using auto mode — runs Karpenter, CoreDNS, VPC CNI
 
   capabilities = {
     kube_proxy    = true # kube proxy
@@ -47,47 +33,21 @@ cluster_config = {
     blockstorage  = true # EBS CSI Driver
     loadbalancing = true # LB Controller
 
-    # Use EKS Managed Capabilities (kro, argocd, ack). 
-    # If false, deployed via Helm automatically instead.
-    # If true, requires Identity Center (see capabilities_config)
-    eks_capabilities = false # Note: NOT available in the ESC partition
+    eks_capabilities = false # NOT available in the ESC partition. kro, argocd, ack are created via Helm automatically instead.
 
-    gitops = true  # ArgoCD — if eks_capabilities = true, requires Identity Center, see below
-    kro    = true  # Kube Resource Orchestrator, required by ArgoCD pipeline
-    ack    = false # AWS Controllers for Kubernetes, not used by this solution
+    gitops = true # ArgoCD
+    kro    = true # Kube Resource Orchestrator, required by ArgoCD pipeline
+
+    # ack              = true # optional, unused by this solution
+    # ack_service_controllers = {
+    #   s3  = ["arn:aws:iam::aws:policy/AmazonS3FullAccess"]
+    #   ec2 = ["arn:aws:iam::aws:policy/AmazonEC2FullAccess"]
+    # }
   }
-
-  # Required when gitops = true & eks_capabilities = true
-  # See: https://docs.aws.amazon.com/eks/latest/userguide/argocd.html
-  #
-  # IAM Identity Center is ONE instance per account and is often enabled in a
-  # different region than where you deploy this platform. argocd_idc_region is
-  # therefore INDEPENDENT of `region` above — set it to the region your Identity
-  # Center instance actually lives in (it may or may not match your deploy region).
-  # Discover the instance ARN + identity store, and a user id, with:
-  #   for r in us-east-1 us-west-2 eu-west-1 eu-central-1; do \
-  #     aws sso-admin list-instances --region $r \
-  #       --query 'Instances[].[InstanceArn,IdentityStoreId]' --output text; done
-  #   aws identitystore list-users --identity-store-id <d-xxxx> --region <idc-region> \
-  #     --query 'Users[].[UserName,UserId]' --output text
-
-  #  capabilities_config = {
-  #    argocd_idc_instance_arn = "arn:aws:sso:::instance/ssoins-XXXXXXXXXX" # REPLACE
-  #    argocd_idc_region       = "us-east-1"                                # REPLACE — the Identity Center instance's region (may differ from `region`)
-  #    argocd_rbac_mappings = [
-  #      {
-  #        role = "ADMIN"
-  #        identities = [
-  #          { id = "REPLACE-WITH-SSO-USER-ID", type = "SSO_USER" } # REPLACE — a UserId from `aws identitystore list-users` above (NOT the user name)
-  #        ]
-  #      }
-  #    ]
-  #  }
-
 }
 
 observability_configuration = {
-  aws_oss_tooling    = false #Amazon Managed Grafana
+  aws_oss_tooling    = false #Amazon Managed Grafana not available in ESC
   aws_native_tooling = false #Amazon CloudWatch Observability EKS
 }
 

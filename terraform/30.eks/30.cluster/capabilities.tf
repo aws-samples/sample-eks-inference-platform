@@ -4,9 +4,9 @@
 locals {
   enabled_capabilities = {
     for k, v in {
-      argocd = { type = "ARGOCD", enabled = local.capabilities.gitops }
-      kro    = { type = "KRO", enabled = local.capabilities.kro }
-      ack    = { type = "ACK", enabled = local.capabilities.ack }
+      argocd = { type = "ARGOCD", enabled = local.capabilities.gitops && local.use_managed_capabilities }
+      kro    = { type = "KRO", enabled = local.capabilities.kro && local.use_managed_capabilities }
+      ack    = { type = "ACK", enabled = local.capabilities.ack && local.use_managed_capabilities }
     } : k => v if v.enabled
   }
 }
@@ -54,7 +54,7 @@ resource "time_sleep" "capability_role_propagation" {
 # EKS Managed Capabilities - ArgoCD (requires Identity Center config)
 ################################################################################
 resource "aws_eks_capability" "argocd" {
-  count = local.capabilities.gitops ? 1 : 0
+  count = local.capabilities.gitops && local.use_managed_capabilities ? 1 : 0
 
   cluster_name              = module.eks.cluster_name
   capability_name           = "argocd"
@@ -111,11 +111,11 @@ resource "aws_eks_capability" "simple" {
 # KRO needs cluster-admin level access to create/manage arbitrary resources
 # defined in ResourceGraphDefinitions (Deployments, Services, etc.)
 resource "aws_eks_access_policy_association" "kro_edit" {
-  count = local.capabilities.kro ? 1 : 0
+  count = local.capabilities.kro && local.use_managed_capabilities ? 1 : 0
 
   cluster_name  = module.eks.cluster_name
   principal_arn = aws_iam_role.capability["kro"].arn
-  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+  policy_arn    = "arn:${local.partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
 
   access_scope {
     type = "cluster"
@@ -198,7 +198,7 @@ resource "aws_iam_policy" "ecr_pull_through" {
       Action = [
         "ecr:BatchImportUpstreamImage",
       ]
-      Resource = "arn:aws:ecr:${local.region}:${data.aws_caller_identity.current.account_id}:repository/docker-hub/*"
+      Resource = "arn:${local.partition}:ecr:${local.region}:${data.aws_caller_identity.current.account_id}:repository/docker-hub/*"
     }]
   })
 }
@@ -376,11 +376,11 @@ resource "kubernetes_service_account" "inference_worker" {
 # Ref: https://docs.aws.amazon.com/eks/latest/userguide/argocd-register-clusters.html
 ################################################################################
 resource "aws_eks_access_policy_association" "argocd_admin" {
-  count = local.capabilities.gitops ? 1 : 0
+  count = local.capabilities.gitops && local.use_managed_capabilities ? 1 : 0
 
   cluster_name  = module.eks.cluster_name
   principal_arn = aws_iam_role.capability["argocd"].arn
-  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+  policy_arn    = "arn:${local.partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
 
   access_scope {
     type = "cluster"
@@ -395,6 +395,8 @@ resource "aws_eks_access_policy_association" "argocd_admin" {
 # Uses the EKS cluster ARN as server (kubernetes.default.svc is not supported).
 ################################################################################
 resource "kubernetes_secret" "argocd_cluster" {
+  # Gated on gitops only (NOT use_managed_capabilities) so the bootstrap's
+  # destination.name=local-cluster resolves for a self-managed ArgoCD too.
   count = local.capabilities.gitops ? 1 : 0
 
   metadata {
@@ -405,12 +407,24 @@ resource "kubernetes_secret" "argocd_cluster" {
     }
   }
 
-  data = {
-    name   = "local-cluster"
-    server = module.eks.cluster_arn
-  }
+  # Managed ArgoCD registers the local cluster by its EKS ARN; self-managed
+  # ArgoCD targets the implicit in-cluster (https://kubernetes.default.svc) and
+  # uses its controller ServiceAccount (no token needed — config just sets TLS).
+  # The for-expression adds `config` only for self-managed, keeping the managed
+  # secret shape (name+server) byte-identical to before.
+  data = merge(
+    {
+      name   = "local-cluster"
+      server = local.use_managed_capabilities ? module.eks.cluster_arn : "https://kubernetes.default.svc"
+    },
+    {
+      for k, v in {
+        config = local.use_managed_capabilities ? "" : jsonencode({ tlsClientConfig = { insecure = false } })
+      } : k => v if v != ""
+    },
+  )
 
-  depends_on = [aws_eks_capability.argocd]
+  depends_on = [aws_eks_capability.argocd, helm_release.argocd_selfmanaged]
 }
 
 ################################################################################
@@ -423,6 +437,10 @@ resource "kubernetes_secret" "argocd_cluster" {
 # workloads at a separate repo with var.gitops_workloads_repo_url.)
 ################################################################################
 resource "kubectl_manifest" "argocd_bootstrap" {
+  # Gated on gitops only (NOT use_managed_capabilities): this is a plain ArgoCD
+  # Application CR that works against a self-installed ArgoCD too. Requires ArgoCD
+  # to be installed (managed capability OR Helm) BEFORE apply so the Application
+  # CRD + argocd namespace exist.
   count = local.capabilities.gitops ? 1 : 0
 
   yaml_body = templatefile("${path.module}/argocd/bootstrap.yaml.tpl", {
@@ -440,6 +458,7 @@ resource "kubectl_manifest" "argocd_bootstrap" {
 
   depends_on = [
     aws_eks_capability.argocd,
+    helm_release.argocd_selfmanaged,
     kubernetes_secret.argocd_cluster,
   ]
 }

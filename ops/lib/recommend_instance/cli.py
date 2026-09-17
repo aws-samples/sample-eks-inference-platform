@@ -9,6 +9,7 @@ import sys
 from . import __doc__ as _PKG_DOC
 from .catalog import KV_BYTES, TP_DEGREES, WEIGHT_BYTES
 from .model import fetch_model
+from .paths import is_valid_instance_type
 from .pricing import detect_region, resolve_prices
 from .recommend import find_options
 from .render import print_human, print_json
@@ -69,6 +70,15 @@ def main(argv: list[str] | None = None) -> int:
                         "Otherwise, auto-scales to a fleet of replicas.")
     p.add_argument("--tp", type=int, choices=TP_DEGREES,
                    help="Pin tensor-parallel degree (1|2|4|8). Default: consider all.")
+    p.add_argument("--instance-type", default=None, metavar="TYPE",
+                   help="Pin the exact EC2 instance type for the emitted "
+                        "VLLMEndpoint (e.g. g6.2xlarge), overriding Karpenter's "
+                        "cheapest-fit choice. Placement becomes deterministic: "
+                        "the pod stays Pending if that type is unavailable "
+                        "rather than falling back to a larger, pricier node. "
+                        "Must have enough GPUs for the chosen gpuCount and be "
+                        "allowed by the gpu-inference NodePool. vllm tier only "
+                        "(ignored for the llm-d tiers).")
     p.add_argument("--region", default=None,
                    help="AWS region for pricing (default: $AWS_REGION, $AWS_DEFAULT_REGION, "
                         "boto3 session, or us-east-1)")
@@ -96,6 +106,29 @@ def main(argv: list[str] | None = None) -> int:
                         "throughput — forces escalation to faster GPUs if needed.")
     p.add_argument("--hf-token", default=os.environ.get("HF_TOKEN"),
                    help="HuggingFace token (also $HF_TOKEN). Required for gated models.")
+    p.add_argument("--tool-call-parser", default=None, metavar="NAME",
+                   help="Override the vLLM tool-call parser written to the manifest "
+                        "(toolCallParser field -> --enable-auto-tool-choice "
+                        "--tool-call-parser NAME). Default: auto-detected from the "
+                        "model architecture. Pass 'none' to force chat-only (disable "
+                        "tool calling).")
+    p.add_argument("--worker-memory", default=None, metavar="SIZE",
+                   help="Override the auto-computed workerMemory (container memory "
+                        "request/limit), e.g. 120Gi. The auto value (~weights+4Gi) can "
+                        "be too low for high tensor-parallel degrees (many worker procs "
+                        "+ torch.compile spike) and cause an OOMKill (exit 137).")
+    p.add_argument("--extra-arg", action="append", default=None, metavar="ARG",
+                   dest="extra_arg",
+                   help="Append raw token(s) to the endpoint's extraArgs (verbatim to "
+                        "`vllm serve`). Two forms, mixable/repeatable:\n"
+                        "  1) A JSON array of tokens (cleanest for several flags), e.g. "
+                        "--extra-arg '[\"--reasoning-parser\",\"qwen3\",\"--kv-cache-dtype\",\"fp8\",\"--enable-prefix-caching\"]' "
+                        "— expanded in order.\n"
+                        "  2) A single literal token; repeat the flag for more. For tokens "
+                        "starting with a dash use the = form so argparse doesn't treat them "
+                        "as options, e.g. --extra-arg=--kv-cache-dtype --extra-arg=fp8. "
+                        "A JSON object value (e.g. a --speculative-config payload) is kept "
+                        "as one literal token, not expanded.")
     p.add_argument("--tier", choices=["auto", "vllm", "llm-d", "llm-d-disagg"], default="auto",
                    help="Serving CRD to emit: vllm=VLLMEndpoint, llm-d=LLMDEndpoint "
                         "(scale tier), llm-d-disagg=LLMDDisaggEndpoint (prefill/decode split). "
@@ -134,6 +167,9 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit("error: --utilization must be in [0.1, 1.0]")
     if args.target_tok_s < 0:
         sys.exit("error: --target-tok-s must be >= 0")
+    if args.instance_type is not None and not is_valid_instance_type(args.instance_type):
+        sys.exit(f"error: --instance-type {args.instance_type!r} is not a valid EC2 instance "
+                 f"type (expected e.g. g6.2xlarge).")
     if args.avg_context is not None and args.avg_context < 1:
         sys.exit("error: --avg-context must be >= 1")
 
@@ -180,6 +216,32 @@ def main(argv: list[str] | None = None) -> int:
         users=1,
     )
     best  = opts[0] if opts else None
+
+    # --instance-type: pin the exact type. Resolve it against the *fitting* set
+    # (find_options already dropped every instance the model can't fit — per-GPU
+    # VRAM, attention-head divisibility, or host RAM). If the pin isn't in that
+    # set the model cannot run on it, so ABORT with a clear reason instead of
+    # emitting a manifest that would OOM (CrashLoopBackOff) or hang Pending. If
+    # it fits, size the manifest to the PINNED type (its gpuCount/TP), not the
+    # auto-picked best — so gpuCount can't drift from the pinned hardware.
+    if args.instance_type:
+        pinned = next((o for o in opts if o.instance.name == args.instance_type), None)
+        if pinned is None:
+            from .catalog import INSTANCES
+            inst = next((i for i in INSTANCES if i.name == args.instance_type), None)
+            if inst is None:
+                sys.exit(
+                    f"error: --instance-type {args.instance_type} is not a GPU instance in the "
+                    f"catalog, so the model cannot be sized against it. Pick a supported GPU "
+                    f"type, or drop --instance-type to let the recommender choose.")
+            sys.exit(
+                f"error: {args.model} does not fit on {args.instance_type} "
+                f"({inst.num_gpus}\u00d7{inst.gpu}, {inst.total_vram_gb} GiB total VRAM) at "
+                f"--seq {args.seq} --quant {args.quant}: it needs ~{vram.total_gb:.0f} GiB "
+                f"(weights {vram.weights_gb:.0f} GiB + KV/activations). Use a larger instance "
+                f"type, lower --seq, apply --quant int4/int8, or drop --instance-type to let "
+                f"the recommender pick a fitting one.")
+        best = pinned
 
     # Auto-fleet decision: can the best instance handle all requested users
     # on its own? If yes → single-instance. If no → fleet mode.

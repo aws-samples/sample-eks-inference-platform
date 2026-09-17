@@ -63,8 +63,8 @@ resource "aws_iam_role_policy" "litellm_bedrock" {
         "bedrock:ConverseStream",
       ]
       Resource = [
-        "arn:aws:bedrock:*::foundation-model/*",
-        "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/*",
+        "arn:${local.partition}:bedrock:*::foundation-model/*",
+        "arn:${local.partition}:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/*",
       ]
     }]
   })
@@ -102,9 +102,33 @@ resource "kubernetes_config_map" "litellm_env" {
     namespace = "ai-platform"
   }
 
-  data = {
-    AWS_REGION = local.region
-  }
+  data = merge(
+    {
+      AWS_REGION = local.region
+      # Bedrock runtime endpoint, read by LiteLLM via os.environ/ in config.yaml
+      # (LiteLLM's Bedrock path signs its own requests — it does NOT read boto3's
+      # native endpoint env vars — so we must feed it a concrete URL). Built from
+      # the partition's DNS suffix so the committed litellm.yaml stays
+      # partition-agnostic: aws -> amazonaws.com (the SDK default), aws-eusc ->
+      # amazonaws.eu (the sovereign host; the .com default doesn't resolve there).
+      # Set unconditionally (like AWS_REGION): LiteLLM reads it through os.environ,
+      # so it must never be absent on a Terraform install.
+      AWS_ENDPOINT_URL_BEDROCK_RUNTIME = "https://bedrock-runtime.${local.region}.${data.aws_partition.current.dns_suffix}"
+    },
+    # ESC (aws-eusc) only: force the sovereign-partition STS endpoint so IRSA
+    # (AssumeRoleWithWebIdentity) validates against the ESC OIDC provider. An SDK
+    # that doesn't know the aws-eusc partition otherwise resolves STS to the
+    # commercial endpoint and fails with InvalidIdentityToken. The endpoint is
+    # sts.<region>.<dns_suffix>; for aws-eusc dns_suffix is amazonaws.eu (same
+    # domain family as the EKS/ECR/OIDC endpoints) — confirmed via
+    # `aws sts get-caller-identity --debug`. Commercial (partition "aws") omits
+    # the key and uses the SDK's default (correct) STS resolution.
+    {
+      for k, v in {
+        AWS_ENDPOINT_URL_STS = local.partition == "aws-eusc" ? "https://sts.${local.region}.${data.aws_partition.current.dns_suffix}" : ""
+      } : k => v if v != ""
+    },
+  )
 
   depends_on = [kubernetes_namespace.ai_platform]
 }

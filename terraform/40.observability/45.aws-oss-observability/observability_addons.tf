@@ -7,13 +7,12 @@ resource "helm_release" "prometheus_node_exporter" {
   version          = var.ne_config.helm_chart_version
   repository       = var.ne_config.helm_repo_url
 
-  dynamic "set" {
-    for_each = var.ne_config.helm_settings
-    content {
-      name  = set.key
-      value = set.value
+  set = [
+    for k, v in var.ne_config.helm_settings : {
+      name  = k
+      value = v
     }
-  }
+  ]
 }
 
 resource "helm_release" "kube_state_metrics" {
@@ -28,11 +27,10 @@ resource "helm_release" "kube_state_metrics" {
     yamlencode(local.critical_addons_tolerations)
   ]
 
-  dynamic "set" {
-    for_each = var.ksm_config.helm_settings
-    content {
-      name  = set.key
-      value = set.value
+  set = [
+    for k, v in var.ksm_config.helm_settings : {
+      name  = k
+      value = v
     }
-  }
+  ]
 }

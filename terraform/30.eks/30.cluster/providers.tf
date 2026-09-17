@@ -13,7 +13,7 @@ terraform {
 
     helm = {
       source  = "hashicorp/helm"
-      version = "~> 2.7"
+      version = "~> 3.0"
     }
     kubectl = {
       source  = "alekc/kubectl"
@@ -37,26 +37,16 @@ provider "aws" {
   }
 }
 
-# Used for ECR authentication 
-provider "aws" {
-  region = "us-east-1"
-  alias  = "virginia"
-  default_tags {
-    tags = local.tags
-  }
-}
-
 provider "helm" {
-  kubernetes {
+  kubernetes = {
     host                   = module.eks.cluster_endpoint
     cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
 
-    exec {
+    exec = {
       api_version = "client.authentication.k8s.io/v1beta1"
       command     = "aws"
       # This requires the awscli to be installed locally where Terraform is executed
       args = ["eks", "get-token", "--cluster-name", module.eks.cluster_name, "--region", local.region]
-
     }
   }
 }

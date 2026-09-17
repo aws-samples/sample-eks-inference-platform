@@ -2,6 +2,8 @@ data "aws_region" "current" {}
 
 data "aws_caller_identity" "current" {}
 
+data "aws_partition" "current" {}
+
 ################################################################################
 # CW EKS Addon
 ################################################################################
@@ -14,7 +16,7 @@ module "aws_cloudwatch_observability_irsa" {
   role_name = "${data.terraform_remote_state.eks.outputs.cluster_name}-cw-ci"
 
   role_policy_arns = {
-    policy = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+    policy = "arn:${data.aws_partition.current.partition}:iam::aws:policy/CloudWatchAgentServerPolicy"
   }
 
   oidc_providers = {
@@ -27,7 +29,7 @@ module "aws_cloudwatch_observability_irsa" {
 
 module "aws_cloudwatch_observability" {
   source  = "aws-ia/eks-blueprints-addons/aws"
-  version = "~> 1.21.0"
+  version = "~> 1.24.0"
   count   = var.observability_configuration.aws_native_tooling ? 1 : 0
 
   cluster_name      = data.terraform_remote_state.eks.outputs.cluster_name

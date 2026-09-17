@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 
 from .catalog import TIME_SLICE_REPLICAS
@@ -369,6 +370,8 @@ def _deploy_flags(args: argparse.Namespace) -> str:
         parts.append(f"--users {args.users}")
     if getattr(args, "tier", "auto") not in (None, "auto"):
         parts.append(f"--tier {args.tier}")
+    if getattr(args, "instance_type", None):
+        parts.append(f"--instance-type {args.instance_type}")
     return (" " + " ".join(parts)) if parts else ""
 
 
@@ -971,6 +974,73 @@ def tool_call_parser_for(architecture: str) -> str:
     return ""
 
 
+# vLLM parser ids are simple tokens (e.g. hermes, qwen3, deepseek_r1,
+# llama4_pythonic). These values are interpolated into a manifest that --deploy
+# commits and ArgoCD applies, so restrict them to a safe charset — same
+# injection-safety posture as the model-id / name validation above.
+_PARSER_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _valid_parser_name(value: str, flag: str) -> str:
+    if not _PARSER_NAME_RE.match(value):
+        sys.exit(f"error: invalid {flag} value {value!r} "
+                 f"(expected a token like hermes, qwen3, or deepseek_r1).")
+    return value
+
+
+# workerMemory / other Kubernetes quantities (e.g. 120Gi, 56Gi, 8G). Validated
+# before interpolation into the manifest.
+_QUANTITY_RE = re.compile(r"^\d+(\.\d+)?(Ei|Pi|Ti|Gi|Mi|Ki|E|P|T|G|M|K)?$")
+
+
+def _valid_quantity(value: str, flag: str) -> str:
+    v = value.strip()
+    if not _QUANTITY_RE.match(v):
+        sys.exit(f"error: invalid {flag} value {value!r} "
+                 f"(expected a Kubernetes quantity like 120Gi, 56Gi, or 8G).")
+    return v
+
+
+def _yaml_scalar(v: str) -> str:
+    """Quote an arbitrary extraArgs token safely for YAML. Handles values that
+    contain double quotes (e.g. JSON like {\"method\":\"mtp\"}) by using single
+    quotes; rejects newlines to prevent manifest injection."""
+    if "\n" in v or "\r" in v:
+        sys.exit(f"error: --extra-arg value must not contain newlines: {v!r}")
+    if '"' in v and "'" not in v:
+        return f"'{v}'"
+    if "'" in v and '"' not in v:
+        return f'"{v}"'
+    if '"' not in v and "'" not in v:
+        return f'"{v}"'
+    # Both quote styles present — escape within a double-quoted scalar.
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _expand_extra_args(raw: list) -> list[str]:
+    """Turn --extra-arg values into an ordered token list. A value that is a
+    JSON array (starts with '[') is parsed and its elements are appended in
+    order (the clean one-flag form). Any other value — including a JSON object
+    like a --speculative-config payload — is kept as a single literal token."""
+    out: list[str] = []
+    for item in raw:
+        s = item.strip() if isinstance(item, str) else item
+        if isinstance(s, str) and s.startswith("["):
+            try:
+                parsed = json.loads(s)
+            except ValueError:
+                sys.exit(f"error: --extra-arg looks like a JSON array but did not parse: {item!r}")
+            if not isinstance(parsed, list):
+                sys.exit(f"error: --extra-arg JSON must be an array of tokens: {item!r}")
+            for el in parsed:
+                if isinstance(el, bool) or not isinstance(el, (str, int, float)):
+                    sys.exit(f"error: --extra-arg array elements must be strings or numbers, got {el!r}")
+                out.append(str(el))
+        else:
+            out.append(item)
+    return out
+
+
 def build_endpoint_yaml(
     kind: str,
     model: ModelSpec, vram: VramEstimate, best: Option,
@@ -1001,6 +1071,10 @@ def build_endpoint_yaml(
     is_disagg = kind == "LLMDDisaggEndpoint"
     is_llmd = kind == "LLMDEndpoint"
     is_llmd_family = is_llmd or is_disagg
+    if getattr(args, "instance_type", None) and is_llmd_family:
+        sys.stderr.write(
+            f"warning: --instance-type {args.instance_type} applies to the vllm tier only; "
+            f"ignoring it for {kind} (the llm-d CRDs have no instanceType field).\n")
     # shared time-slicing is a single-replica, non-llm-d feature.
     shared = (not scaling) and (not is_llmd_family) and best.total_gpus == 1 and best.shared_eligible
 
@@ -1045,7 +1119,11 @@ def build_endpoint_yaml(
 
     lines.append(f"  maxModelLen: {max_len}")
     lines.append(f"  minVramPerGpuGiB: {min_vram_gib}")
-    lines.append(f'  workerMemory: "{worker_mem_gib}Gi"')
+    wm_override = getattr(args, "worker_memory", None)
+    if wm_override:
+        lines.append(f'  workerMemory: "{_valid_quantity(wm_override, "--worker-memory")}"   # set via --worker-memory')
+    else:
+        lines.append(f'  workerMemory: "{worker_mem_gib}Gi"')
 
     if is_disagg:
         # Disaggregated scale tier: prefill (compute-bound) and decode (KV-cache/
@@ -1087,6 +1165,12 @@ def build_endpoint_yaml(
     elif kind == "VLLMEndpoint":
         # vLLM is the fixed-size tier — no built-in autoscaler, so a single
         # replica count (not min/max). The llm-d tier is the scale path.
+        # Optional exact instance-type pin (--instance-type): cli.py has already
+        # verified the model fits this type and sized gpuCount/TP to it, so we
+        # just emit the field. Placement is deterministic — the pod stays Pending
+        # if the type is unavailable instead of upsizing to a bigger box.
+        if getattr(args, "instance_type", None):
+            lines.append(f"  instanceType: {args.instance_type}   # pinned via --instance-type")
         lines.append(f"  # maxNumSeqs: {max_num_seqs}")
         lines.append(f"  replicas: {min_replicas}")
         # The hf-cache emptyDir stages the full checkpoint (HF download or S3
@@ -1098,14 +1182,33 @@ def build_endpoint_yaml(
                          f'~{vram.weights_gb:,.0f} GiB — also ensure the node volume fits '
                          f'(tfvar gpu_node_volume_size_gib)')
 
-    # Tool/function calling applies to all three tiers (each fronts vLLM). Auto-
-    # enable it for known tool-capable families so tool_choice:auto works out of
-    # the box; written explicitly so it's visible and overridable (delete for
-    # chat-only, or change if you pin a different vllmImage). Unknown families
-    # emit nothing (chat-only).
-    parser = tool_call_parser_for(model.architecture)
+    # Tool/function calling applies to all three tiers (each fronts vLLM). An
+    # explicit --tool-call-parser wins; otherwise auto-enable it for known
+    # tool-capable families so tool_choice:auto works out of the box. Written
+    # explicitly so it's visible and overridable (delete for chat-only, or change
+    # if you pin a different vllmImage). Unknown families emit nothing (chat-only).
+    # Pass --tool-call-parser none to force chat-only on an auto-detected family.
+    override = getattr(args, "tool_call_parser", None)
+    if override is not None:
+        override = override.strip()
+        if override.lower() in ("", "none"):
+            parser = ""  # explicit opt-out -> chat-only
+        else:
+            parser = _valid_parser_name(override, "--tool-call-parser")
+        origin = "set via --tool-call-parser"
+    else:
+        parser = tool_call_parser_for(model.architecture)
+        origin = f"auto-detected from {model.architecture}"
     if parser:
-        lines.append(f"  toolCallParser: {parser}   # auto-detected from {model.architecture} — enables tool calling; remove for chat-only")
+        lines.append(f"  toolCallParser: {parser}   # {origin} — enables tool calling; remove for chat-only")
+
+    # extraArgs: raw --extra-arg tokens appended verbatim to `vllm serve`.
+    # JSON-array values are expanded in order; other values stay literal.
+    extra = _expand_extra_args(list(getattr(args, "extra_arg", None) or []))
+    if extra:
+        lines.append("  extraArgs:   # raw vLLM flags appended to `vllm serve`")
+        for a in extra:
+            lines.append(f"    - {_yaml_scalar(a)}")
 
     yaml_body = "\n".join(lines) + "\n"
     return name, yaml_path, yaml_body, commit_msg
@@ -1123,10 +1226,21 @@ def _print_yaml_snippet(model: ModelSpec, vram: VramEstimate, best: Option,
            "LLMDEndpoint": "fleet of 2+ replicas -> llm-d scale tier (KV/prefix/load-aware routing)",
            "VLLMEndpoint": "single replica -> plain vLLM (simplest, no router)"}.get(kind, kind)
     print(f"\n{C.BOLD}Serving tier:{C.RESET} {C.BOLD}{kind}{C.RESET} {C.DIM}- {why}{C.RESET}")
-    parser = tool_call_parser_for(model.architecture)
-    if parser:
-        print(f"{C.DIM}  tool calling: enabled — --tool-call-parser {parser} "
-              f"(auto-detected from {model.architecture}; remove toolCallParser for chat-only).{C.RESET}")
+    override = getattr(args, "tool_call_parser", None)
+    if override is not None:
+        ov = override.strip()
+        if ov.lower() in ("", "none"):
+            print(f"{C.DIM}  tool calling: disabled — chat-only (via --tool-call-parser none).{C.RESET}")
+        else:
+            print(f"{C.DIM}  tool calling: enabled — --tool-call-parser {ov} (via --tool-call-parser).{C.RESET}")
+    else:
+        parser = tool_call_parser_for(model.architecture)
+        if parser:
+            print(f"{C.DIM}  tool calling: enabled — --tool-call-parser {parser} "
+                  f"(auto-detected from {model.architecture}; remove toolCallParser for chat-only).{C.RESET}")
+    extra = _expand_extra_args(list(getattr(args, "extra_arg", None) or []))
+    if extra:
+        print(f"{C.DIM}  extraArgs: {' '.join(extra)} (appended to `vllm serve`).{C.RESET}")
     if kind in ("LLMDEndpoint", "LLMDDisaggEndpoint"):
         prof = pick_routing_profile(args)
         print(f"{C.DIM}  routingProfile '{prof}' baked into the manifest (EPP scorer weights).{C.RESET}")

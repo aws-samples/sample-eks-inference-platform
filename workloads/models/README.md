@@ -35,7 +35,7 @@ directory-per-namespace convention above is unchanged.
 
 ## Bedrock — available out of the box
 
-Bedrock's `claude-opus-4-8` is a static LiteLLM entry (no GPUs, no CR), so a
+`bedrock/amazon.nova-lite-v1:0` is a static LiteLLM entry (no GPUs, no CR), so a
 fresh install serves against it immediately. To serve any other model, point a
 `VLLMEndpoint` at a HuggingFace model ID — including a model you've fine-tuned and
 pushed to HF (private repos need a token). The platform serves models; it does not
@@ -50,5 +50,5 @@ model then answers `tool_choice: auto` requests — from Open WebUI or the API �
 out of the box instead of erroring. It's written explicitly so you can see and
 change it: delete the line for chat-only, or adjust it if you pin a different
 `vllmImage` (parser names are vLLM-version-specific). Models from unrecognized
-families deploy chat-only (no `toolCallParser`) — add one by hand if the model
-supports tools. For any other vLLM flag, use `extraArgs: ["--flag", "value"]`.
+families deploy chat-only (no `toolCallParser`) — add one if the model
+supports tools. For any other vLLM flag, use `--extraArgs`.

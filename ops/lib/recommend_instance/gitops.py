@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -183,6 +184,44 @@ def _argocd_sync(root: str, C: type, app: str = ARGOCD_MODELS_APP) -> None:
           f"prune) — applies in seconds.")
 
 
+def _ensure_hf_token_secret(namespace: str, token: str, root: str, C: type) -> None:
+    """Create/update the namespace-scoped `hf-token` Secret (key `token`) that the
+    serving pod reads via `secretKeyRef` (env HF_TOKEN). Without it the pod pulls
+    HuggingFace unauthenticated (rate-limited/slow, and gated models fail).
+
+    Deliberately imperative and idempotent (`create --dry-run=client | apply`):
+    the secret is a credential and must NOT be committed to git, so it lives
+    outside the GitOps flow. Best-effort — a failure here does not undo the push
+    (git remains the source of truth); we print a manual fallback.
+
+    Note: the token is passed on the kubectl argv (visible briefly in `ps`),
+    which is the standard kubectl secret-creation tradeoff."""
+    if shutil.which("kubectl") is None:
+        print(f"{C.YELLOW}kubectl not found{C.RESET} — could not create the hf-token "
+              f"secret; the pod will pull HuggingFace unauthenticated. Create it with:\n"
+              f"  kubectl create secret generic hf-token -n {namespace} "
+              f"--from-literal=token=YOUR_TOKEN")
+        return
+    gen = _run(["kubectl", "create", "secret", "generic", "hf-token",
+                "-n", namespace, "--from-literal=token=" + token,
+                "--dry-run=client", "-o", "yaml"], cwd=root)
+    if gen.returncode != 0:
+        print(f"{C.YELLOW}Could not render the hf-token secret{C.RESET} "
+              f"({gen.stderr.strip() or 'kubectl failed'}).")
+        return
+    apply = subprocess.run(["kubectl", "apply", "-n", namespace, "-f", "-"],
+                           input=gen.stdout, capture_output=True, text=True, cwd=root)
+    if apply.returncode != 0:
+        print(f"{C.YELLOW}Could not apply the hf-token secret{C.RESET} "
+              f"({apply.stderr.strip() or 'kubectl failed'}).")
+        print(f"{C.DIM}Create it manually: kubectl create secret generic hf-token "
+              f"-n {namespace} --from-literal=token=YOUR_TOKEN{C.RESET}")
+        return
+    print(f"{C.GREEN}✓ hf-token secret ensured{C.RESET} in namespace '{namespace}' — "
+          f"the pod authenticates to HuggingFace. (An already-running pod must be "
+          f"restarted to pick it up: kubectl rollout restart deploy -n {namespace} -l app.kubernetes.io/instance)")
+
+
 def deploy_model(name: str, yaml_path: str, yaml_body: str, commit_msg: str,
                  args) -> int:
     """Write the model YAML to the repo and commit + push it."""
@@ -231,6 +270,16 @@ def deploy_model(name: str, yaml_path: str, yaml_body: str, commit_msg: str,
 
     rc = _git_commit_push(root, yaml_path, commit_msg, C)
     if rc == 0:
+        # If a token was supplied (--hf-token or $HF_TOKEN), ensure the pod's
+        # hf-token Secret exists in the target namespace BEFORE the sync creates
+        # the pod (secretKeyRef is read at pod start; it's optional, so a missing
+        # secret silently yields unauthenticated HF pulls). Namespace is read
+        # from the manifest so it works for inference/ and team-<name>/ alike.
+        token = getattr(args, "hf_token", None)
+        if token:
+            m = re.search(r"^\s*namespace:\s*(\S+)", yaml_body, re.M)
+            ns = m.group(1) if m else "inference"
+            _ensure_hf_token_secret(ns, token, root, C)
         _argocd_sync(root, C, _app_for_path(yaml_path))
         print(f"\n{C.DIM}Watch it come up:{C.RESET} "
               f"kubectl get vllmendpoints,llmdendpoints,llmddisaggendpoints -n inference -w")

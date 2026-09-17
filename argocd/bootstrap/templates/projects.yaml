@@ -50,12 +50,18 @@ spec:
   # workloads directory named anything other than `inference` or `team-<name>`
   # (the convention in workloads.yaml) targets a namespace outside this list and
   # is refused — the naming convention becomes enforced, not just documented.
+  #
+  # Matched by SERVER URL (not name): with self-managed ArgoCD the built-in
+  # `in-cluster` and the `local-cluster` alias secret share the same server URL
+  # (https://kubernetes.default.svc), so ArgoCD canonicalizes app destinations to
+  # `in-cluster`. Matching by `name: local-cluster` would then never match; the
+  # server URL matches regardless of which name ArgoCD reports.
   destinations:
-    - name: local-cluster
+    - server: https://kubernetes.default.svc
       namespace: ai-platform
-    - name: local-cluster
+    - server: https://kubernetes.default.svc
       namespace: inference
-    - name: local-cluster
+    - server: https://kubernetes.default.svc
       namespace: team-*
   # Deny ALL cluster-scoped resources: an empty whitelist permits nothing.
   clusterResourceWhitelist: []

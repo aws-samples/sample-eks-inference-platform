@@ -406,18 +406,29 @@ _status_check() {
   pf_pid=$!
   sleep 4
 
-  if curl -fsS "$base/v1/models" -H "Authorization: Bearer $mk" >/dev/null 2>&1; then
+  local models_json first_model=""
+  if models_json=$(curl -fsS "$base/v1/models" -H "Authorization: Bearer $mk" 2>/dev/null); then
     ok "LiteLLM gateway responding (/v1/models)"
+    if command -v jq >/dev/null 2>&1; then
+      echo "$models_json" | jq -r '.data[].id' 2>/dev/null | sed 's/^/    - /'
+      first_model=$(echo "$models_json" | jq -r '.data[0].id // empty' 2>/dev/null)
+    else
+      echo "    $models_json"
+    fi
   else
     warn "LiteLLM gateway not responding"
   fi
-  code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/v1/chat/completions" \
-    -H "Authorization: Bearer $mk" -H "Content-Type: application/json" \
-    -d '{"model":"claude-opus-4-8","messages":[{"role":"user","content":"ping"}],"max_tokens":5}')
-  if [ "$code" = "200" ]; then
-    ok "Bedrock frontier model answered (claude-opus-4-8)"
+  if [ -n "$first_model" ]; then
+    code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/v1/chat/completions" \
+      -H "Authorization: Bearer $mk" -H "Content-Type: application/json" \
+      -d "{\"model\":\"$first_model\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":5}")
+    if [ "$code" = "200" ]; then
+      ok "Model answered ($first_model)"
+    else
+      warn "Model call ($first_model) returned HTTP $code — check model access (Bedrock: per-account console toggle) / config"
+    fi
   else
-    warn "Bedrock model call returned HTTP $code — enable Bedrock model access in the console (per-account toggle)"
+    warn "No models registered in /v1/models yet — expected before you deploy one. Add a model with ./platformctl new-model (or configure a Bedrock model in litellm.yaml). Skipping the chat test."
   fi
   if kubectl run pfcheck-langfuse --rm -i --restart=Never --image=curlimages/curl:8.11.0 -n "$NS_PLATFORM" --quiet -- \
        -fsS http://langfuse-web.ai-platform.svc.cluster.local:3000/api/public/health >/dev/null 2>&1; then
@@ -427,6 +438,10 @@ _status_check() {
   fi
 
   [ -n "${pf_pid:-}" ] && kill "$pf_pid" 2>/dev/null || true
+  # --check reports health via ok/warn lines; a warning (e.g. no models yet, or
+  # Langfuse still starting) is not a failure, so always exit 0. Hard failures
+  # use die (non-zero) explicitly earlier.
+  return 0
 }
 
 # ---- tunnel ---------------------------------------------------------------- #

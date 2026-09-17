@@ -156,8 +156,10 @@ plan: init tf-select-ws
 # module.eks.cluster_endpoint, which isn't known until the cluster exists, so on
 # a brand-new cluster the alekc/kubectl provider fails with "invalid provider
 # configuration: no configuration has been provided". Targeting module.eks first
-# creates the cluster so the providers resolve. Runs only when module.eks isn't
-# in state yet (the very first apply); it's a no-op on every apply after that.
+# creates the cluster so the providers resolve. Runs unconditionally for the
+# cluster module: a targeted apply is idempotent (0 changes once module.eks
+# exists), so it safely repairs missing/orphaned cluster state instead of being
+# skipped by a state-list guard that false-matched module.eks data sources.
 apply: init tf-select-ws
 	@echo ENVIRONMENT=$(ENVIRONMENT) MODULE=$(MODULE) terraform::apply
 	@# First apply of the cluster module is done in two phases: a targeted apply
@@ -172,8 +174,8 @@ apply: init tf-select-ws
 	@# attached in the same phase. (This block only runs for the module that
 	@# contains `module "eks"`, i.e. 30.eks/30.cluster, which is the only module
 	@# that declares module.ebs_csi_driver_irsa.)
-	@if grep -rqsE '^[[:space:]]*module[[:space:]]+"eks"' $(MODULE)/*.tf 2>/dev/null && ! terraform -chdir=$(MODULE) state list 2>/dev/null | grep -q '^module\.eks'; then \
-		echo ">> First apply: creating the EKS cluster (module.eks) first so the Kubernetes providers can configure"; \
+	@if grep -rqsE '^[[:space:]]*module[[:space:]]+"eks"' $(MODULE)/*.tf 2>/dev/null; then \
+		echo ">> Cluster stage: applying module.eks (+ EBS-CSI IRSA) first so the Kubernetes/Helm/kubectl providers configure against a live endpoint (idempotent: 0 changes once the cluster exists)"; \
 		terraform -chdir=$(MODULE) apply -target=module.eks -target=module.ebs_csi_driver_irsa -input=false -lock=true -auto-approve -var-file=$(VAR_FILE) 2>&1 | tee -a tf-logs/$(notdir $(MODULE))-apply.log || { echo "targeted module.eks apply failed for $(MODULE)"; exit 1; }; \
 	fi
 	@$(call execute_terraform,$(MODULE),apply,"-auto-approve")

@@ -5,8 +5,16 @@ data "aws_availability_zones" "available" {
 }
 
 locals {
-  name                  = "${var.shared_config.resources_prefix}-${terraform.workspace}"
-  azs                   = slice(data.aws_availability_zones.available.names, 0, var.num_azs)
+  name = "${var.shared_config.resources_prefix}-${terraform.workspace}"
+  # Use up to var.num_azs zones, but never more than the region actually exposes.
+  # ESC (eusc-de-east-1) launched with 2 AZs, while commercial regions have 3+.
+  #
+  # We select by AZ *ID* (e.g. euscdee1-az1), not name. The terraform-aws-modules/vpc
+  # module decides name-vs-id with regexall("^[a-z]{2}-", az): ESC's 4-letter region
+  # prefix ("eusc-") fails that test, so an AZ *name* like "eusc-de-east-1a" is
+  # misrouted into availability_zone_id and rejected by EC2. AZ IDs never match that
+  # regex (in any partition), so they are correctly placed in availability_zone_id.
+  azs                   = slice(data.aws_availability_zones.available.zone_ids, 0, min(var.num_azs, length(data.aws_availability_zones.available.zone_ids)))
   private_subnets       = [for k, v in module.subnets.network_cidr_blocks : v if endswith(k, "/private")]
   public_subnets        = [for k, v in module.subnets.network_cidr_blocks : v if endswith(k, "/public")]
   control_plane_subnets = [for k, v in module.subnets.network_cidr_blocks : v if endswith(k, "/controlplane")]

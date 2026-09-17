@@ -1,5 +1,6 @@
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 data "aws_iam_session_context" "current" {
   # This data source provides information on the IAM source role of an STS assumed role
   # For non-role ARNs, this data source simply passes the ARN through issuer ARN
@@ -57,7 +58,7 @@ module "eks" {
 
   # Combine root account, current user/role and additinoal roles to be able to access the cluster KMS key - required for terraform updates
   kms_key_administrators = distinct(concat([
-    "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"],
+    "arn:${local.partition}:iam::${data.aws_caller_identity.current.account_id}:root"],
     var.kms_key_admin_roles,
     [data.aws_iam_session_context.current.issuer_arn]
   ))
@@ -149,7 +150,7 @@ module "eks" {
 
       policy_associations = {
         single = {
-          policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
+          policy_arn = "arn:${local.partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy"
           access_scope = {
             type = "cluster"
           }
@@ -162,7 +163,7 @@ module "eks" {
 
       policy_associations = {
         single = {
-          policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
+          policy_arn = "arn:${local.partition}:eks::aws:cluster-access-policy/AmazonEKSAdminPolicy"
           access_scope = {
             type = "cluster"
           }
@@ -174,7 +175,7 @@ module "eks" {
       principal_arn     = data.terraform_remote_state.iam.outputs.iam_roles_map["EKSEdit"]
       policy_associations = {
         single = {
-          policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
+          policy_arn = "arn:${local.partition}:eks::aws:cluster-access-policy/AmazonEKSEditPolicy"
           access_scope = {
             namespaces = ["default"]
             type       = "namespace"
@@ -188,7 +189,7 @@ module "eks" {
 
       policy_associations = {
         single = {
-          policy_arn = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+          policy_arn = "arn:${local.partition}:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
           access_scope = {
             namespaces = ["default"]
             type       = "namespace"
@@ -216,7 +217,7 @@ module "eks" {
       instance_types = ["m6g.large"]
       ami_type       = "AL2023_ARM_64_STANDARD"
       iam_role_additional_policies = {
-        SSM = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        SSM = "arn:${local.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
       }
 
       labels = {
@@ -256,7 +257,7 @@ module "ebs_csi_driver_irsa" {
   role_name = "${local.cluster_name}-ebs-csi"
 
   role_policy_arns = {
-    policy = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+    policy = "arn:${local.partition}:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
   }
 
   oidc_providers = {
@@ -283,7 +284,7 @@ resource "aws_eks_access_policy_association" "automode_node" {
   access_scope {
     type = "cluster"
   }
-  policy_arn    = "arn:aws:eks::aws:cluster-access-policy/AmazonEKSAutoNodePolicy"
+  policy_arn    = "arn:${local.partition}:eks::aws:cluster-access-policy/AmazonEKSAutoNodePolicy"
   principal_arn = module.eks.node_iam_role_arn
 }
 
@@ -347,7 +348,7 @@ resource "kubernetes_annotations" "gp2" {
 }
 
 resource "kubernetes_storage_class_v1" "gp3" {
-  count = local.capabilities.blockstorage ? 1 : 0
+  count = local.capabilities.blockstorage && !local.eks_auto_mode ? 1 : 0
   metadata {
     name = "gp3"
     annotations = {

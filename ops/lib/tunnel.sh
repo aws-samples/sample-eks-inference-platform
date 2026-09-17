@@ -38,10 +38,14 @@ LANGFUSE_IP=$(kubectl get svc langfuse-web -n "$NAMESPACE" -o jsonpath='{.spec.c
 # port (4180) and map it to local :9090, keeping the same URL for the operator.
 DASHBOARD_IP=$(kubectl get svc oauth2-proxy -n "$NAMESPACE" -o jsonpath='{.spec.clusterIP}')
 DASHBOARD_REMOTE_PORT=$(kubectl get svc oauth2-proxy -n "$NAMESPACE" -o jsonpath='{.spec.ports[0].port}')
+# ArgoCD lives in its own namespace. argocd-server serves TLS on 443, so this
+# tunnel is HTTPS (self-signed cert — accept the browser warning).
+ARGOCD_IP=$(kubectl get svc argocd-server -n argocd -o jsonpath='{.spec.clusterIP}')
 echo "  open-webui:        $OPENWEBUI_IP:8080"
 echo "  litellm:           $LITELLM_IP:4000"
 echo "  langfuse-web:      $LANGFUSE_IP:3000"
 echo "  cluster-dashboard: $DASHBOARD_IP:$DASHBOARD_REMOTE_PORT (via oauth2-proxy, so Approve/Dismiss are authenticated)"
+echo "  argocd-server:     $ARGOCD_IP:443 (HTTPS)"
 
 echo ""
 echo "→ Starting SSM tunnels (via ClusterIP — bypasses ALB allowlist)..."
@@ -49,6 +53,7 @@ echo "  Open WebUI:  http://localhost:8080"
 echo "  LiteLLM:     http://localhost:4000"
 echo "  Langfuse:    http://localhost:3000"
 echo "  Dashboard:   http://localhost:9090"
+echo "  ArgoCD:      https://localhost:8090"
 echo ""
 
 # Each SSM port-forwarding session can go idle and exit on its own (default
@@ -65,10 +70,10 @@ echo ""
 # keeps working without the operator having to notice and restart everything.
 # (Plain indexed arrays, not associative — this must run on bash 3.2, macOS's
 # default /bin/bash, which has no `declare -A`.)
-LOCAL_PORTS=(8080 4000 3000 9090)
-REMOTE_HOSTS=("$OPENWEBUI_IP" "$LITELLM_IP" "$LANGFUSE_IP" "$DASHBOARD_IP")
-REMOTE_PORTS=(8080 4000 3000 "$DASHBOARD_REMOTE_PORT")
-SSM_PIDS=(0 0 0 0)
+LOCAL_PORTS=(8080 4000 3000 9090 8090)
+REMOTE_HOSTS=("$OPENWEBUI_IP" "$LITELLM_IP" "$LANGFUSE_IP" "$DASHBOARD_IP" "$ARGOCD_IP")
+REMOTE_PORTS=(8080 4000 3000 "$DASHBOARD_REMOTE_PORT" 443)
+SSM_PIDS=(0 0 0 0 0)
 
 start_forward() {
   local i="$1"
@@ -79,14 +84,14 @@ start_forward() {
   SSM_PIDS[$i]=$!
 }
 
-for i in 0 1 2 3; do start_forward "$i"; done
+for i in 0 1 2 3 4; do start_forward "$i"; done
 
 cleanup() { kill "${SSM_PIDS[@]}" 2>/dev/null; exit; }
 trap cleanup INT TERM
 
 while true; do
   sleep 30
-  for i in 0 1 2 3; do
+  for i in 0 1 2 3 4; do
     if ! kill -0 "${SSM_PIDS[$i]}" 2>/dev/null; then
       echo "→ tunnel :${LOCAL_PORTS[$i]} died, restarting..." >&2
       start_forward "$i"
