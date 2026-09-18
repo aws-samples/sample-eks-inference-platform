@@ -213,6 +213,33 @@ def resolve(region: str, query: str, fms: list[dict],
 # Pricing (AWS Price List API — best-effort)                                   #
 # --------------------------------------------------------------------------- #
 
+# Max plausible USD per token. Even the priciest frontier models sit well under
+# $100 / 1M tokens (1e-4/token); anything above this is a unit-scale error (e.g. a
+# per-1M dimension mis-scaled as per-1K), so reject it rather than bake a value
+# ~1000x too high into the committed CR.
+_MAX_PLAUSIBLE_PER_TOKEN = 1e-3
+
+
+def _tokens_per_unit(unit: str, desc: str) -> int | None:
+    """Tokens represented by one Price List unit (1_000 or 1_000_000), read from
+    the dimension's unit/description — or None when it's ambiguous.
+
+    Structured, not a guess: AWS increasingly prices per 1,000,000 tokens with a
+    bare unit like 'tokens', so defaulting an unlabeled unit to per-1K makes a
+    per-1M price 1000x too high. Return a scale ONLY when the text clearly says
+    1K or 1M; otherwise None, so the caller skips the dimension (and falls back to
+    --input-cost/--output-cost or LiteLLM's map) instead of recording a wrong price.
+    """
+    t = f"{unit} {desc}".lower().replace(",", "").replace(" ", "")
+    # Check 1M before 1K: "1000000" contains "1000". Match the numeric magnitude
+    # (survives words between the number and "tokens", e.g. "per 1000 input tokens").
+    if "1000000" in t or "1mtoken" in t or "per1m" in t or "/1m" in t or "million" in t:
+        return 1_000_000
+    if "1000" in t or "1ktoken" in t or "per1k" in t or "/1k" in t:
+        return 1_000
+    return None
+
+
 def token_prices(region: str, fm: dict) -> tuple[float | None, float | None]:
     """Best-effort (input, output) USD-per-token from the AWS Price List API.
 
@@ -257,9 +284,12 @@ def token_prices(region: str, fm: dict) -> tuple[float | None, float | None]:
                         per_unit = float(usd)
                         if per_unit <= 0:
                             continue
-                        # Bedrock token dims are typically per 1,000 tokens.
-                        divisor = 1_000_000.0 if ("1m" in unit or "million" in desc) else 1_000.0
-                        per_token = per_unit / divisor
+                        scale = _tokens_per_unit(unit, desc)
+                        if scale is None:
+                            continue  # ambiguous unit — don't guess (would risk a 1000x error)
+                        per_token = per_unit / scale
+                        if per_token > _MAX_PLAUSIBLE_PER_TOKEN:
+                            continue  # unit-scale sanity clamp
                         if "input" in desc and in_price is None:
                             in_price = per_token
                         elif "output" in desc and out_price is None:
