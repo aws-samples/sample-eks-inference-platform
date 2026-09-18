@@ -23,6 +23,11 @@ rules:
     # watch/list to observe; get for re-reads; patch/update to add and remove
     # the finalizer on metadata.
     verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["bedrock.ai-platform"]
+    resources: ["bedrockmodels"]
+    # Bedrock models enrolled via `platformctl new-model --source bedrock` — same
+    # observe + finalizer-patch access as the serving tiers.
+    verbs: ["get", "list", "watch", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

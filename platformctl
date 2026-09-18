@@ -340,7 +340,7 @@ cmd_status() {
   kubectl get pods -n "$NS_PLATFORM" 2>/dev/null || true
   echo
   log "Serving endpoints (all namespaces)"
-  kubectl get vllmendpoints,llmdendpoints,llmddisaggendpoints -A 2>/dev/null || echo "  (none deployed)"
+  kubectl get vllmendpoints,llmdendpoints,llmddisaggendpoints,bedrockmodels -A 2>/dev/null || echo "  (none deployed)"
 
   echo
   _status_access
@@ -399,7 +399,7 @@ _status_access() {
 _status_check() {
   log "Validating the platform end-to-end (--check)"
   need aws
-  local mk code base="http://127.0.0.1:4000" pf_pid=""
+  local mk code base="http://127.0.0.1:4000" pf_pid="" failures=0
   mk=$(kubectl get secret litellm-secrets -n "$NS_PLATFORM" -o jsonpath='{.data.master-key}' 2>/dev/null | base64 -d) \
     || { warn "cannot read litellm master key — is the platform up?"; return 1; }
   kubectl port-forward -n "$NS_PLATFORM" svc/litellm 4000:4000 >/dev/null 2>&1 &
@@ -417,6 +417,7 @@ _status_check() {
     fi
   else
     warn "LiteLLM gateway not responding"
+    failures=$((failures + 1))
   fi
   if [ -n "$first_model" ]; then
     code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/v1/chat/completions" \
@@ -426,22 +427,31 @@ _status_check() {
       ok "Model answered ($first_model)"
     else
       warn "Model call ($first_model) returned HTTP $code — check model access (Bedrock: per-account console toggle) / config"
+      failures=$((failures + 1))
     fi
   else
-    warn "No models registered in /v1/models yet — expected before you deploy one. Add a model with ./platformctl new-model (or configure a Bedrock model in litellm.yaml). Skipping the chat test."
+    warn "No models registered in /v1/models yet — expected before you enroll one (not a failure). Add a self-hosted model with ./platformctl new-model, or a Bedrock model with ./platformctl new-model --source bedrock. Skipping the chat test."
   fi
   if kubectl run pfcheck-langfuse --rm -i --restart=Never --image=curlimages/curl:8.11.0 -n "$NS_PLATFORM" --quiet -- \
        -fsS http://langfuse-web.ai-platform.svc.cluster.local:3000/api/public/health >/dev/null 2>&1; then
     ok "Langfuse tracing reachable"
   else
     warn "Langfuse health check failed (tracing may be starting)"
+    failures=$((failures + 1))
   fi
 
   [ -n "${pf_pid:-}" ] && kill "$pf_pid" 2>/dev/null || true
-  # --check reports health via ok/warn lines; a warning (e.g. no models yet, or
-  # Langfuse still starting) is not a failure, so always exit 0. Hard failures
-  # use die (non-zero) explicitly earlier.
-  return 0
+  # Exit code is meaningful for CI/automation: 0 only when every real check
+  # passed. The legitimately-empty case (no models registered yet) is expected
+  # and is NOT counted as a failure. Hard failures — gateway unreachable, a
+  # registered model returning non-200, or Langfuse unhealthy — return non-zero
+  # so an automated smoke test can detect a broken platform.
+  if [ "$failures" -eq 0 ]; then
+    ok "Platform healthy"
+    return 0
+  fi
+  warn "$failures check(s) failed — the platform is not fully healthy (see above)"
+  return 1
 }
 
 # ---- tunnel ---------------------------------------------------------------- #

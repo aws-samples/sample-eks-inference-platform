@@ -33,13 +33,16 @@ By default, models live in this repo. For real multi-team self-service, point
 access to the **workloads repo only** — never the platform repo. The
 directory-per-namespace convention above is unchanged.
 
-## Bedrock — available out of the box
+## Bedrock — self-service enrollment (no GPUs)
 
-`bedrock/amazon.nova-lite-v1:0` is a static LiteLLM entry (no GPUs, no CR), so a
-fresh install serves against it immediately. To serve any other model, point a
-`VLLMEndpoint` at a HuggingFace model ID — including a model you've fine-tuned and
-pushed to HF (private repos need a token). The platform serves models; it does not
-train them. (Serving weights directly from your own S3 bucket is on the roadmap.)
+Amazon Bedrock models are enrolled with `./platformctl new-model --source bedrock
+<model> --deploy`, which commits a `BedrockModel` CR (no GPUs, no serving pod) and
+litellm-sync registers it on the `/v1` API. Nothing ships by default — list what's
+invokable in your region/partition with `--source bedrock --list-available-models`.
+To serve any open-source model instead, point a `VLLMEndpoint` at a HuggingFace
+model ID — including a model you've fine-tuned and pushed to HF (private repos need
+a token). The platform serves models; it does not train them. (Serving weights
+directly from your own S3 bucket is on the roadmap.)
 
 ## Tool / function calling
 

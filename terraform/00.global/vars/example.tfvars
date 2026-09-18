@@ -18,8 +18,10 @@ shared_config = {
 # Operator CIDR allowlist for the EKS PUBLIC API endpoint. REQUIRED whenever
 # private_eks_cluster = false (below): a plan-time check refuses to expose the
 # control plane to 0.0.0.0/0. Set this to the public egress IP/CIDR(s) you run
-# platformctl/kubectl from (office, VPN, CI).
-cluster_endpoint_public_access_cidrs = ["<REPLACE>/32"]
+# platformctl/kubectl from (office, VPN, CI), then uncomment the line below.
+# Left commented, the variable defaults to [] and the plan fails closed with a
+# clear "not scoped" message — instead of a CIDR parse error on the placeholder.
+# cluster_endpoint_public_access_cidrs = ["<REPLACE>/32"]   # e.g. ["203.0.113.10/32"]
 
 cluster_config = {
   kubernetes_version = "1.36"

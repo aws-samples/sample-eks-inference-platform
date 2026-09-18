@@ -1,14 +1,15 @@
 # litellm-sync
 
-The **single owner of LiteLLM's model registry**. Watches the three serving-tier
-custom resources cluster-wide and registers each model with LiteLLM on create,
-deregisters it on delete — so LiteLLM's `/v1/models` always matches what's deployed.
+The **single owner of LiteLLM's model registry**. Watches the serving-tier custom
+resources and `BedrockModel`s cluster-wide and registers each model with LiteLLM on
+create, deregisters it on delete — so LiteLLM's `/v1/models` always matches what's deployed.
 
 ## Why this exists
 
 Models are declared as KRO custom resources — `VLLMEndpoint` (simple vLLM),
 `LLMDEndpoint` (llm-d scale tier), and `LLMDDisaggEndpoint` (llm-d prefill/decode
-disaggregation). Something has to tell LiteLLM about them (`POST /model/new`) and
+disaggregation) — plus `BedrockModel` (a managed Amazon Bedrock model; a plain
+CRD, no KRO/infra). Something has to tell LiteLLM about them (`POST /model/new`) and
 remove them when they're deleted.
 
 Doing that with a per-CR registration Job (the previous design) has two problems:
@@ -49,12 +50,13 @@ Registration is idempotent and self-healing: a model already live in `/v1/models
 is left alone; otherwise a stale DB entry is removed and the model re-added so it
 lands back in the running router.
 
-### Static models are protected
+### What the reconcile sweep can and can't delete
 
 Deregistration only ever touches **DB-registered** models (`model_info.db_model ==
-true`). Static config-file models declared in `litellm.yaml` — notably the Bedrock
-`claude-opus-4-8` baseline — report `db_model: false` and are skipped. They can
-never be deleted by this controller.
+true`), and only when **no live CR** (a serving-tier CR or a `BedrockModel`) still
+claims the name — so every CR-backed model is protected, including Bedrock models
+enrolled via `platformctl new-model --source bedrock`. Any truly static entry in
+`litellm.yaml` (none by default) reports `db_model: false` and is skipped outright.
 
 ## Operational notes
 

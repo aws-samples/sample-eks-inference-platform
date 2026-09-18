@@ -63,11 +63,24 @@ spec:
       namespace: inference
     - server: https://kubernetes.default.svc
       namespace: team-*
+    # EKS-managed ArgoCD (managed capabilities) registers the in-cluster
+    # destination as the NAMED cluster `local-cluster` whose server URL is NOT
+    # https://kubernetes.default.svc, so the server-based entries above don't
+    # match and every workload app fails with InvalidSpecError. Also allow the
+    # destination BY NAME — same namespaces, same enforced boundary — so both
+    # self-managed and EKS-managed ArgoCD work.
+    - name: local-cluster
+      namespace: ai-platform
+    - name: local-cluster
+      namespace: inference
+    - name: local-cluster
+      namespace: team-*
   # Deny ALL cluster-scoped resources: an empty whitelist permits nothing.
   clusterResourceWhitelist: []
-  # Permit ONLY the KRO endpoint/team kinds. Every other namespaced kind
-  # (Deployment, Secret, Role/RoleBinding, ServiceAccount, raw Pod, …) is
-  # refused, so a workloads commit cannot escalate privilege or read secrets.
+  # Permit ONLY the KRO endpoint/team kinds plus the (infra-less) BedrockModel
+  # marker. Every other namespaced kind (Deployment, Secret, Role/RoleBinding,
+  # ServiceAccount, raw Pod, …) is refused, so a workloads commit cannot escalate
+  # privilege or read secrets.
   namespaceResourceWhitelist:
     - group: kro.run
       kind: VLLMEndpoint
@@ -77,3 +90,8 @@ spec:
       kind: LLMDDisaggEndpoint
     - group: kro.run
       kind: AITeam
+    # Self-service Amazon Bedrock enrollment (platformctl new-model --source
+    # bedrock). Without this, ArgoCD refuses to sync a BedrockModel CR
+    # ("resource bedrock.ai-platform:BedrockModel is not permitted in project").
+    - group: bedrock.ai-platform
+      kind: BedrockModel

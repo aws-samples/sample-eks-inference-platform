@@ -1,0 +1,96 @@
+# BedrockModel — self-service enrollment of an Amazon Bedrock model.
+#
+# A Bedrock model has nothing to deploy or scale (no GPU, no pod, no serving
+# Deployment), so — unlike the vLLM/llm-d serving tiers — this is NOT a KRO
+# ResourceGraphDefinition (there is no resource graph to expand). It is a plain,
+# infra-less marker CR: `litellm-sync` watches it and registers/deregisters the
+# model in LiteLLM (POST /model/new) exactly like it does for the serving-tier
+# CRs, but with Bedrock `litellm_params` (model: bedrock/<id>) instead of an
+# in-cluster openai/ api_base. Auth at invocation time is the `litellm`
+# ServiceAccount's IRSA role — no keys in the CR.
+#
+# Because a CR backs the model, it is a first-class citizen of litellm-sync's
+# register/finalizer/reconcile lifecycle: the reconcile sweep only deregisters
+# DB models whose name has NO live CR, so a BedrockModel is protected the same
+# way a VLLMEndpoint is — no special-casing needed.
+#
+# Authored by `./platformctl new-model --source bedrock <model>` (which resolves
+# the region/partition-correct invocation id, the sovereign runtime endpoint for
+# non-commercial partitions, and the per-token price from the AWS Price List
+# API, then commits the CR under workloads/models/). Removal is `git rm` the
+# file (or `./platformctl new-model --undeploy <name>`).
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: bedrockmodels.bedrock.ai-platform
+  labels:
+    app.kubernetes.io/part-of: ai-platform
+spec:
+  group: bedrock.ai-platform
+  scope: Namespaced
+  names:
+    plural: bedrockmodels
+    singular: bedrockmodel
+    kind: BedrockModel
+    shortNames:
+      - bedrockmodel
+      - brm
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - model
+              properties:
+                model:
+                  type: string
+                  description: >-
+                    Full LiteLLM Bedrock model string, including the provider
+                    prefix and the region/partition-correct invocation id — a
+                    cross-region system inference profile where one exists
+                    (e.g. "bedrock/us.amazon.nova-lite-v1:0"), otherwise the
+                    bare foundation-model id (e.g. "bedrock/amazon.nova-lite-v1:0"
+                    in single-region / sovereign partitions).
+                modelName:
+                  type: string
+                  description: >-
+                    LiteLLM alias callers use on the /v1 API. Defaults to
+                    metadata.name when unset.
+                bedrockEndpoint:
+                  type: string
+                  description: >-
+                    Optional Bedrock runtime endpoint URL. Set only for
+                    non-commercial partitions (e.g. the AWS European Sovereign
+                    Cloud's amazonaws.eu host); omit in the standard aws
+                    partition so LiteLLM uses its default endpoint.
+                inputCostPerToken:
+                  type: string
+                  description: >-
+                    Optional USD cost per input token, for accurate per-region
+                    spend tracking (LiteLLM's built-in map is US-centric).
+                    Populated from the AWS Price List API at enrollment when
+                    available.
+                outputCostPerToken:
+                  type: string
+                  description: Optional USD cost per output token. See inputCostPerToken.
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Alias
+          type: string
+          jsonPath: .spec.modelName
+        - name: Model
+          type: string
+          jsonPath: .spec.model
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp

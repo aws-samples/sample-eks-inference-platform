@@ -147,6 +147,26 @@ def main(argv: list[str] | None = None) -> int:
                         "is not required with --undeploy.")
     p.add_argument("--yes", "-y", action="store_true",
                    help="Skip the confirmation prompt for --deploy/--undeploy.")
+
+    # --- Amazon Bedrock enrollment (--source bedrock) ------------------------ #
+    # A Bedrock model runs in AWS — no GPU sizing. These flags drive a separate
+    # code path (recommend_instance/bedrock.py) that lists/resolves models from
+    # the live Bedrock APIs and emits a BedrockModel CR.
+    p.add_argument("--source", choices=["huggingface", "bedrock"], default="huggingface",
+                   help="Model source. 'huggingface' (default): self-host on GPUs "
+                        "(the sizing path). 'bedrock': enroll a managed Amazon "
+                        "Bedrock model (no GPUs) via a BedrockModel CR.")
+    p.add_argument("--list-available-models", action="store_true",
+                   help="With --source bedrock: list the Bedrock models invokable "
+                        "in this region (alias, invocation id, pricing) and exit.")
+    p.add_argument("--model-name", default=None, metavar="ALIAS",
+                   help="With --source bedrock: override the LiteLLM alias "
+                        "(default: derived from the model id, e.g. 'nova-lite').")
+    p.add_argument("--input-cost", type=float, default=None, metavar="USD_PER_TOKEN",
+                   help="With --source bedrock: override input $/token (e.g. for "
+                        "partitions the AWS Price List API doesn't cover, like ESC).")
+    p.add_argument("--output-cost", type=float, default=None, metavar="USD_PER_TOKEN",
+                   help="With --source bedrock: override output $/token. See --input-cost.")
     args = p.parse_args(argv)
 
     # --undeploy is a pure file/git operation: short-circuit before any HF fetch
@@ -154,6 +174,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.undeploy is not None:
         from .gitops import undeploy_model
         return undeploy_model(args.undeploy, args)
+
+    # --source bedrock: enroll or list Amazon Bedrock models. Handled entirely by
+    # the bedrock module; short-circuit BEFORE any HF fetch / VRAM sizing /
+    # instance recommendation, none of which apply to a managed Bedrock model.
+    if args.source == "bedrock":
+        from .bedrock import run_bedrock
+        return run_bedrock(args)
 
     # Every other path needs a model to size/recommend.
     if not args.model:

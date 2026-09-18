@@ -150,6 +150,14 @@ clickhouse:
       <metric_log replace="1"><engine>ENGINE = MergeTree PARTITION BY toYYYYMM(event_date) ORDER BY (event_date, event_time) TTL event_date + INTERVAL 3 DAY DELETE SETTINGS ttl_only_drop_parts=1</engine></metric_log>
       <asynchronous_metric_log replace="1"><engine>ENGINE = MergeTree PARTITION BY toYYYYMM(event_date) ORDER BY (event_date, event_time) TTL event_date + INTERVAL 3 DAY DELETE SETTINGS ttl_only_drop_parts=1</engine></asynchronous_metric_log>
     </clickhouse>
+  # PVCs intentionally omit `storageClass` so they bind the cluster DEFAULT
+  # StorageClass, which Terraform marks per cluster mode: `gp3` (ebs.csi.aws.com)
+  # on classic/self-managed clusters incl. ESC (capabilities.blockstorage), and
+  # `auto-ebs-sc` (ebs.csi.eks.amazonaws.com) on EKS Auto Mode — see
+  # terraform/30.eks/30.cluster/main.tf. Do NOT pin `storageClass: gp3` here:
+  # that class does not exist in Auto Mode, so the PVC would stay Pending.
+  # (A non-Auto cluster with capabilities.blockstorage=false has no default SC at
+  # all — stateful components like Langfuse aren't supported in that config.)
   persistence:
     enabled: true
     size: 50Gi
@@ -176,6 +184,9 @@ redis:
     existingSecret: langfuse-secrets
     existingSecretPasswordKey: redis-password
   primary:
+    # Binds the cluster default StorageClass (see the clickhouse.persistence note
+    # above) — no `storageClass` pinned, so it works on classic/self-managed (gp3)
+    # and Auto Mode (auto-ebs-sc) alike.
     persistence:
       enabled: true
       size: 8Gi

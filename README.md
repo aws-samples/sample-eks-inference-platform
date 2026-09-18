@@ -2,7 +2,7 @@
 
 **Run every AI model your teams need - one API, your AWS account!**
   
-This sample solution provides a self-service platform that lets teams use large language models the way they ship code: commit a few lines of YAML, git push, and the platform handles the rest - GPUs, serving, scaling, routing, and monitoring. Use frontier **models from Amazon Bedrock** out of the box with no GPUs to manage or **deploy any open-source models**, provisioned and served automatically.
+This sample solution provides a self-service platform that lets teams use large language models the way they ship code: commit a few lines of YAML, git push, and the platform handles the rest - GPUs, serving, scaling, routing, and monitoring. Enroll frontier **models from Amazon Bedrock** with a single command - no GPUs to manage - or **deploy any open-source model**, provisioned and served automatically.
   
 And it all runs in your AWS account and desired AWS region - including the AWS European Sovereign Cloud - so your data and models stay where you control them.
   
@@ -41,11 +41,19 @@ The custom resources **are** the self-service interface:
 | **`VLLMEndpoint`** | Serve a model on vLLM - the simple default: one model, one pod, one instance (any Hugging Face model ID) |
 | **`LLMDEndpoint`** | Serve a model on the llm-d scale tier - KV-cache/load/prefix-aware routing across replicas (the `inference-gateway` substrate ships on every cluster; no toggle) |
 | **`LLMDDisaggEndpoint`** | Serve on the llm-d scale + performance tier - independently autoscaled prefill/decode pools (same llm-d substrate; no toggle) |
+| **`BedrockModel`** | Enroll a managed Amazon Bedrock model - no GPUs, no serving pod (`platformctl new-model --source bedrock`); litellm-sync registers it on the same `/v1` API |
 | **`AITeam`** | Onboard a team: namespace, RBAC, budget, rate limits, scoped API key |
 
-Bedrock models need no resource - they're a few lines of LiteLLM config (`litellm.yaml`), live the
-moment the cluster is up. KRO definitions live in `platform/config/kro/`; extend
-them there and every model/team inherits the change.
+Bedrock models need no GPUs and no serving pod - enroll one with
+`./platformctl new-model --source bedrock <model>` and the platform commits a
+`BedrockModel` CR; litellm-sync registers it on the `/v1` API in seconds.
+Nothing ships by default, so the committed config never pins a model id that
+would be wrong in another region or partition - the CLI resolves the
+region/partition-correct invocation id (a cross-region inference profile where
+one exists, else the base model id) and its price at enrollment. KRO definitions
+live in `platform/config/kro/` and the `BedrockModel` CRD in
+`platform/config/bedrockmodel-crd.yaml`; extend them there and every model/team
+inherits the change.
 
 Every model answers through the same LiteLLM `/v1` API, so governance, budgets, and
 tracing apply uniformly - including the optional **llm-d** scale tier
@@ -64,7 +72,7 @@ tracing apply uniformly - including the optional **llm-d** scale tier
 - **Terraform**, **kubectl**, **make**, **jq**, **git**, and **python3** with **boto3**
 
 **AWS account setup**:
-- (Optional) If using **Amazon Bedrock models**. Enable desired model(s) in the AWS console and specify model id(s) in `litellm.yaml`.
+- (Optional) If using **Amazon Bedrock models**: enable the desired model(s) in the AWS console (one-time model-access toggle). You enroll them after the cluster is up with `./platformctl new-model --source bedrock` (nothing is pinned in git) - see the Quick start.
 - (Optional) For any **self deployed model**, sufficient **service quota** for the GPU instance types you plan to self-host on (not needed for the Bedrock-only path)
 - (Optional) If using EKS Managed Capabilities (`eks_capabilities = true`):
   An **IAM Identity Center** instance for managed ArgoCD - its ARN and the SSO user who should get
@@ -106,22 +114,7 @@ cd terraform/00.global/vars && cp example.tfvars dev.tfvars
 # In case of using EKS Managed Capabilities `eks_capabilities = true`: Your Identity Center ARN + **its region** (`argocd_idc_region`, may differ from `region`) + your **SSO user id** (`argocd_rbac_mappings`), 
 ```
 
-2. Optional for use with Bedrock, adjust `litellm.yaml`, and update model_list:
-
-```yaml
-      - model_name: opus-4-8
-        litellm_params:
-          model: bedrock/global.anthropic.claude-opus-4-8
-          aws_region_name: os.environ/AWS_REGION
-```
-
-For AWS European Sovereign Cloud (ESC)
-```yaml
-      - model_name: nova-lite
-        litellm_params:
-          model: bedrock/amazon.nova-lite-v1:0
-          aws_region_name: os.environ/AWS_REGION
-```
+2. No models ship by default. You enroll them after the cluster is up - Amazon Bedrock in one command (step 5) or a self-hosted model (step 6). Nothing model-specific is pinned in git, so the committed config is correct in any region and partition (including the ESC partition).
 
 3. Provision everything (VPC → EKS + capabilities → Karpenter → secrets).
 ```bash
@@ -132,10 +125,25 @@ For AWS European Sovereign Cloud (ESC)
 4. Test - no GPUs yet (up already pointed kubectl at the new cluster)
 ```bash
 ./platformctl tunnel        # forward the UIs (WebUI / LiteLLM / Langfuse / Grafana / ArgoCD)
-./platformctl status --check  # verify Bedrock + models answer AND Langfuse tracing works
+./platformctl status --check  # verify the platform is healthy + Langfuse tracing works (no models answer yet - you enroll them next)
 ```
 
-5. Deploy a self-hosted model with one command. 
+5. Enroll an Amazon Bedrock model - no GPUs, live in seconds.
+```bash
+# See what's invokable in your region/partition (alias, invocation id, pricing):
+./platformctl new-model --source bedrock --list-available-models
+# Enroll one: resolves the region/partition-correct invocation id (a cross-region
+# inference profile where one exists, else the base model id) + per-token price,
+# commits a BedrockModel CR, and litellm-sync registers it on the /v1 API.
+./platformctl new-model --source bedrock nova-lite --deploy   # add -y to skip the confirm prompt
+```
+Drop `--deploy` to preview the `BedrockModel` CR without pushing. Requires Bedrock
+model access enabled in-account (a one-time console toggle). For a partition the
+AWS Price List API doesn't cover (e.g. ESC), pass `--input-cost`/`--output-cost`
+to record accurate per-token pricing. Remove it later with
+`./platformctl new-model --undeploy nova-lite`.
+
+6. Deploy a self-hosted model with one command. 
 ```bash
 # `new-model` right-sizes it and ships it end to end:
 #      - reads the model's config from Hugging Face and computes its VRAM +
@@ -176,7 +184,7 @@ Example with fine tuning
 > hourly cost) may differ from the recommendation. The model still fits and serves
 > correctly; only the specific instance may vary. To override the selection, you may specify  `--instance-type`.
 
-6. Removing a model 
+7. Removing a model 
 
 Folder `workloads/models/inference`
 ```bash
@@ -206,7 +214,7 @@ Known Issues
 - Public ECR Repo equivalent not available. Karpenter, ACK, aws-application-networking (LB/Gateway), eks-distro will be loaded from `public.ecr.aws`.
 - Requires NAT Gateway
 - EKS Managed Capability not available - add-ons will be installed via Helm automatically instead `eks_capabilities = false`
-- Bedrock: Limited models available, make sure to adjust `litellm.yaml`
+- Bedrock (ESC): limited catalog - list what's invokable with `./platformctl new-model --source bedrock --list-available-models`. The AWS Price List API doesn't cover the ESC partition, so pass `--input-cost`/`--output-cost` when enrolling for accurate per-token cost tracking.
 
 ## Beyond the basics
 
@@ -342,6 +350,7 @@ aws iam list-roles --query "Roles[?contains(RoleName, '<cluster-name>')].RoleNam
 ```
 argocd/bootstrap/   ApplicationSets (platform services + self-service workloads)
 platform/
+  config/           BedrockModel CRD (bedrockmodel-crd.yaml) - Bedrock enrollment
   config/kro/       VLLMEndpoint · LLMDEndpoint · LLMDDisaggEndpoint · AITeam (the API)
   services/         litellm, litellm-sync, open-webui, langfuse, gpu-operator,
                     cluster-dashboard (+ Platform Health Agent), inference-gateway

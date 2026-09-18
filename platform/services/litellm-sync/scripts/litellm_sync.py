@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """litellm-sync — the single owner of LiteLLM's model registry.
 
-Watches the three serving-tier custom resources cluster-wide and keeps LiteLLM's
-model list in sync, so the master key never has to enter a workload namespace and
-models can be deployed into any namespace (e.g. per-team `team-*` namespaces):
+Watches the serving-tier custom resources AND BedrockModels cluster-wide and
+keeps LiteLLM's model list in sync, so the master key never has to enter a
+workload namespace and models can be deployed into any namespace (e.g. per-team
+`team-*` namespaces):
 
-  Tiers (kro.run/v1alpha1), each in ANY namespace:
+  Serving tiers (kro.run/v1alpha1), each in ANY namespace:
     - vllmendpoints        -> api_base http://<name>-vllm.<ns>.svc.cluster.local:8000/v1
     - llmdendpoints        -> api_base http://<name>-epp.<ns>.svc.cluster.local:80/v1
     - llmddisaggendpoints  -> api_base http://<name>-epp.<ns>.svc.cluster.local:80/v1
+
+  Bedrock models (bedrock.ai-platform/v1alpha1), in ANY namespace:
+    - bedrockmodels        -> native LiteLLM bedrock/ upstream (no api_base;
+                              auth = the litellm pod's IRSA role)
 
 Lifecycle (finalizer-driven, self-healing):
 
@@ -30,8 +35,10 @@ exists means concurrent callers reading LiteLLM's eventually-consistent
 /model/info can only ever shrink the row count — so a model always converges to
 exactly one entry and can never accumulate duplicates. Deregistration deletes
 ALL rows for a name and only ever touches DB-registered models
-(model_info.db_model == True) — static config models (e.g. the Bedrock
-claude-opus-4-8 in litellm.yaml) have db_model == False and are never deleted.
+(model_info.db_model == True); a model is swept only when NO live CR still claims
+its name, so every CR-backed model — including Bedrock models enrolled via
+`platformctl new-model --source bedrock` — is protected. Any static config-file
+model in litellm.yaml (db_model == False) is excluded outright and never deleted.
 
 Single replica, no database. If killed mid-loop, the next start re-lists current
 state (watch is list-then-watch) and the reconcile loop repairs any drift. All
@@ -72,18 +79,34 @@ RECONCILE_INTERVAL_SEC = int(os.environ.get("RECONCILE_INTERVAL_SEC", "600"))
 HTTP_TIMEOUT_SEC = int(os.environ.get("HTTP_TIMEOUT_SEC", "15"))
 WATCH_TIMEOUT_SEC = int(os.environ.get("WATCH_TIMEOUT_SEC", "300"))
 
-CR_GROUP = "kro.run"
 CR_VERSION = "v1alpha1"
 
-# Serving tiers this controller owns, and how to build each one's LiteLLM
-# api_base from the CR name + namespace. All are kro.run/v1alpha1, cluster-wide.
+# Serving tiers (KRO, group kro.run): registered as an in-cluster,
+# OpenAI-compatible upstream. Value = how to build each one's LiteLLM api_base
+# from the CR name + namespace. All cluster-wide.
 #   vLLM (simple):     the model-server Service, port 8000
 #   llm-d / disagg:    the llm-d Endpoint-Picker (EPP) Service, port 80
-KINDS = {
+SERVING_GROUP = "kro.run"
+SERVING_KINDS = {
     "vllmendpoints": "http://{name}-vllm.{ns}.svc.cluster.local:8000/v1",
     "llmdendpoints": "http://{name}-epp.{ns}.svc.cluster.local:80/v1",
     "llmddisaggendpoints": "http://{name}-epp.{ns}.svc.cluster.local:80/v1",
 }
+
+# Bedrock models (plain CRD, group bedrock.ai-platform): registered as a native
+# LiteLLM Bedrock upstream (model: bedrock/<id>, NO api_base — auth at call time
+# is the litellm pod's IRSA role). Authored by
+# `platformctl new-model --source bedrock`. Same finalizer/register/reconcile
+# lifecycle as the serving tiers; only the emitted litellm_params differ.
+BEDROCK_GROUP = "bedrock.ai-platform"
+BEDROCK_KINDS = {"bedrockmodels"}
+
+# Every watched CR kind -> its API group. One watch thread per kind.
+KIND_GROUP = {
+    **{plural: SERVING_GROUP for plural in SERVING_KINDS},
+    **{plural: BEDROCK_GROUP for plural in BEDROCK_KINDS},
+}
+KINDS = list(KIND_GROUP)   # stable iteration order for watch threads + reconcile
 
 stop_event = threading.Event()
 
@@ -150,8 +173,11 @@ def list_db_model_ids() -> dict[str, list[str]] | None:
     return result
 
 
-def register_model(name: str, model_id: str, api_base: str) -> bool:
+def register_model(name: str, litellm_params: dict) -> bool:
     """Ensure `name` is registered exactly once in LiteLLM. Duplicate-safe.
+
+    `litellm_params` is the provider-specific block (an in-cluster openai/ + api_base
+    for the serving tiers, or a native bedrock/ upstream for BedrockModels).
 
     Held under REGISTRY_LOCK so a concurrent watch + reconcile can't both add the
     same model. Crucially, this is *monotonic*: it only ADDS when there is no DB
@@ -164,6 +190,10 @@ def register_model(name: str, model_id: str, api_base: str) -> bool:
     *grow* duplicates under startup churn. Because this version never adds when a
     row is present, repeated passes can only shrink the row count — so it always
     converges to exactly one, even if reads lag writes.
+
+    NOTE: because it never re-adds an existing row, it does NOT push param changes
+    (e.g. a refreshed Bedrock price) onto an already-registered model — undeploy +
+    redeploy the CR to apply changed litellm_params.
     """
     with REGISTRY_LOCK:
         db_models = list_db_model_ids()
@@ -178,11 +208,11 @@ def register_model(name: str, model_id: str, api_base: str) -> bool:
             return True
         resp = _litellm_request("POST", "/model/new", {
             "model_name": name,
-            "litellm_params": {"model": f"openai/{model_id}", "api_base": api_base, "api_key": "no-key"},
+            "litellm_params": litellm_params,
         })
         if resp is None:
             return False
-        log.info("registered model %s -> %s", name, api_base)
+        log.info("registered model %s (%s)", name, litellm_params.get("model"))
         return True
 
 
@@ -224,12 +254,56 @@ def _has_deletion_timestamp(obj: dict) -> bool:
 
 
 def _api_base(plural: str, name: str, ns: str) -> str:
-    return KINDS[plural].format(name=name, ns=ns)
+    return SERVING_KINDS[plural].format(name=name, ns=ns)
 
 
-def _model_id(obj: dict) -> str:
-    # Upstream served-model-name — the serving tiers pass --served-model-name spec.model.
-    return (obj.get("spec") or {}).get("model", "")
+def _spec(obj: dict) -> dict:
+    return obj.get("spec") or {}
+
+
+def _model_alias(plural: str, obj: dict) -> str:
+    """The LiteLLM model_name (alias) for a CR. Serving tiers use the CR name; a
+    BedrockModel may override it via spec.modelName (default: the CR name).
+    This is the name registered in LiteLLM and tracked by the reconcile sweep."""
+    name = (obj.get("metadata") or {}).get("name", "")
+    if plural in BEDROCK_KINDS:
+        return _spec(obj).get("modelName") or name
+    return name
+
+
+def _litellm_params_for(plural: str, obj: dict) -> dict | None:
+    """Build the LiteLLM litellm_params for a CR, or None if it isn't ready to
+    register (no spec.model)."""
+    spec = _spec(obj)
+    model = spec.get("model")
+    if not model:
+        return None
+    if plural in BEDROCK_KINDS:
+        # Native Bedrock upstream: no api_base/api_key (auth = the litellm pod's
+        # IRSA role). spec.model already carries the "bedrock/<id>" provider
+        # string with the region/partition-correct invocation id.
+        params: dict = {"model": model}
+        endpoint = spec.get("bedrockEndpoint")
+        if endpoint:
+            params["aws_bedrock_runtime_endpoint"] = endpoint
+        name = (obj.get("metadata") or {}).get("name", "")
+        for cr_key, ll_key in (("inputCostPerToken", "input_cost_per_token"),
+                               ("outputCostPerToken", "output_cost_per_token")):
+            val = spec.get(cr_key)
+            if val in (None, ""):
+                continue
+            try:
+                params[ll_key] = float(val)
+            except (TypeError, ValueError):
+                log.warning("bedrockmodel %s: ignoring non-numeric %s=%r", name, cr_key, val)
+        return params
+    # Serving tiers: in-cluster OpenAI-compatible upstream.
+    meta = obj.get("metadata") or {}
+    return {
+        "model": f"openai/{model}",
+        "api_base": _api_base(plural, meta.get("name", ""), meta.get("namespace", "")),
+        "api_key": "no-key",
+    }
 
 
 def _patch_finalizers(custom: client.CustomObjectsApi, plural: str, ns: str, name: str,
@@ -237,7 +311,7 @@ def _patch_finalizers(custom: client.CustomObjectsApi, plural: str, ns: str, nam
     patch = {"metadata": {"finalizers": finalizers}}
     try:
         custom.patch_namespaced_custom_object(
-            group=CR_GROUP, version=CR_VERSION, namespace=ns,
+            group=KIND_GROUP[plural], version=CR_VERSION, namespace=ns,
             plural=plural, name=name, body=patch,
         )
         return True
@@ -249,12 +323,13 @@ def _patch_finalizers(custom: client.CustomObjectsApi, plural: str, ns: str, nam
 
 
 def process(custom: client.CustomObjectsApi, plural: str, obj: dict) -> None:
-    """Route one serving-tier object to the right handler."""
+    """Route one CR (serving tier or BedrockModel) to the right handler."""
     meta = obj.get("metadata") or {}
     name = meta.get("name")
     ns = meta.get("namespace", "")
     if not name:
         return
+    alias = _model_alias(plural, obj)
 
     if _has_deletion_timestamp(obj):
         current = _finalizers(obj)
@@ -262,7 +337,7 @@ def process(custom: client.CustomObjectsApi, plural: str, obj: dict) -> None:
             return
         # Deregister first; only drop the finalizer once LiteLLM confirms, else
         # retry on the next event / reconcile.
-        if not deregister_model(name):
+        if not deregister_model(alias):
             log.warning("keeping finalizer on %s/%s until deregistration succeeds", ns, name)
             return
         remaining = [f for f in current if f != FINALIZER]
@@ -275,9 +350,9 @@ def process(custom: client.CustomObjectsApi, plural: str, obj: dict) -> None:
     if FINALIZER not in current:
         if _patch_finalizers(custom, plural, ns, name, current + [FINALIZER]):
             log.info("added finalizer to %s/%s", ns, name)
-    model_id = _model_id(obj)
-    if model_id:
-        register_model(name, model_id, _api_base(plural, name, ns))
+    params = _litellm_params_for(plural, obj)
+    if params:
+        register_model(alias, params)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +366,7 @@ def watch_kind(plural: str) -> None:
             w = watch.Watch()
             stream = w.stream(
                 custom.list_cluster_custom_object,
-                group=CR_GROUP, version=CR_VERSION, plural=plural,
+                group=KIND_GROUP[plural], version=CR_VERSION, plural=plural,
                 timeout_seconds=WATCH_TIMEOUT_SEC,
             )
             for event in stream:
@@ -326,7 +401,7 @@ def reconcile_once(custom: client.CustomObjectsApi) -> None:
     for plural in KINDS:
         try:
             items = custom.list_cluster_custom_object(
-                group=CR_GROUP, version=CR_VERSION, plural=plural,
+                group=KIND_GROUP[plural], version=CR_VERSION, plural=plural,
             ).get("items", [])
         except ApiException as e:
             if e.status != 404:
@@ -334,7 +409,7 @@ def reconcile_once(custom: client.CustomObjectsApi) -> None:
             continue
         any_kind_listed = True
         for obj in items:
-            live_names.add(obj["metadata"]["name"])
+            live_names.add(_model_alias(plural, obj))
             process(custom, plural, obj)
 
     # Sweep orphaned DB models only if we successfully listed at least one kind
@@ -374,15 +449,23 @@ def _health_server() -> None:
         def do_GET(self) -> None:  # noqa: N802
             try:
                 client.CustomObjectsApi().list_cluster_custom_object(
-                    group=CR_GROUP, version=CR_VERSION, plural="vllmendpoints", limit=1,
+                    group=SERVING_GROUP, version=CR_VERSION, plural="vllmendpoints", limit=1,
                 )
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"ok")
+            except ApiException:
+                # API server reachable, but the CRD may be absent (a Bedrock-only
+                # / kro=false install has no vllmendpoints CRD -> 404) or the list
+                # may be RBAC-scoped (403). Either way the API is up and the
+                # watch/reconcile loops handle missing CRDs by backoff, so we're
+                # healthy. Only a transport failure (below) is unhealthy.
+                pass
             except Exception as e:  # noqa: BLE001
                 self.send_response(503)
                 self.end_headers()
                 self.wfile.write(str(e).encode())
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
 
         def log_message(self, *_: object) -> None:
             pass
