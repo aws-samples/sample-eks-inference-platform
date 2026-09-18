@@ -149,28 +149,64 @@ def _litellm_request(method: str, path: str, body: dict | None = None) -> dict |
     return None
 
 
-def list_db_model_ids() -> dict[str, list[str]] | None:
-    """Return {model_name: [model_id, ...]} for DB-registered models only.
+def list_db_model_ids() -> dict[str, list[tuple[str, dict]]] | None:
+    """Return {model_name: [(model_id, litellm_params), ...]} for DB-registered
+    models only.
 
-    Unlike a name->id map, this preserves EVERY DB row for a name, so duplicate
-    registrations of the same model (multiple rows sharing one model_name) are
-    visible and can be cleaned up. Static config-file models (db_model == False)
-    are excluded so they can never be selected for deletion. Returns None if
-    LiteLLM is unreachable.
+    Preserves EVERY DB row for a name (so duplicate registrations are visible and
+    can be collapsed) and carries each row's live litellm_params (so register_model
+    can detect when a CR's params have drifted from what's registered). Static
+    config-file models (db_model == False) are excluded so they can never be
+    selected for deletion. Returns None if LiteLLM is unreachable.
     """
     info = _litellm_request("GET", "/model/info")
     if info is None:
         return None
-    result: dict[str, list[str]] = {}
+    result: dict[str, list[tuple[str, dict]]] = {}
     for entry in info.get("data", []) or []:
         model_info = entry.get("model_info") or {}
         if not model_info.get("db_model"):
             continue
         name = entry.get("model_name")
         model_id = model_info.get("id")
+        params = entry.get("litellm_params") or {}
         if name and model_id:
-            result.setdefault(name, []).append(model_id)
+            result.setdefault(name, []).append((model_id, params))
     return result
+
+
+# litellm_params keys this controller sets and can meaningfully diff. api_key is
+# deliberately excluded: LiteLLM redacts it in /model/info, so comparing it would
+# always report drift and churn.
+_DRIFT_KEYS = ("model", "api_base", "aws_bedrock_runtime_endpoint",
+               "input_cost_per_token", "output_cost_per_token")
+
+
+def _params_drifted(current: dict, desired: dict) -> bool:
+    """True when a param the CR now specifies differs from what LiteLLM has.
+
+    Conservative by design so it can never churn: a key that LiteLLM does NOT
+    echo back in `current` is treated as "can't compare -> not drift" (so if a
+    given LiteLLM build omits e.g. cost fields from /model/info, that edit simply
+    isn't hot-applied — the pre-existing documented behavior — rather than
+    re-registering every reconcile). Only a key present in BOTH and differing
+    counts. Costs compared with a small relative tolerance; other keys exact.
+    """
+    current = current or {}
+    for k in _DRIFT_KEYS:
+        if k not in desired or k not in current:
+            continue
+        dv, cv = desired[k], current[k]
+        if k in ("input_cost_per_token", "output_cost_per_token"):
+            try:
+                if abs(float(cv) - float(dv)) > abs(float(dv)) * 1e-6 + 1e-15:
+                    return True
+            except (TypeError, ValueError):
+                if str(cv) != str(dv):
+                    return True
+        elif cv != dv:
+            return True
+    return False
 
 
 def register_model(name: str, litellm_params: dict) -> bool:
@@ -180,31 +216,48 @@ def register_model(name: str, litellm_params: dict) -> bool:
     for the serving tiers, or a native bedrock/ upstream for BedrockModels).
 
     Held under REGISTRY_LOCK so a concurrent watch + reconcile can't both add the
-    same model. Crucially, this is *monotonic*: it only ADDS when there is no DB
-    row for the name, and otherwise only REMOVES extra rows (keep the first,
-    delete the rest). It never adds while a row already exists.
+    same model. It is *near-monotonic*: with unchanged params it only ADDS when
+    there is no DB row for the name and otherwise only REMOVES extra rows (keep
+    the first, delete the rest); the sole exception is a real params change, which
+    re-registers the one kept row (see "Param drift" below).
 
     That monotonicity is what makes it robust against LiteLLM's eventually-
     consistent /model/info: an earlier delete-all-then-add design could act on a
     stale read (see fewer rows than really exist, delete those, add one) and so
-    *grow* duplicates under startup churn. Because this version never adds when a
-    row is present, repeated passes can only shrink the row count — so it always
-    converges to exactly one, even if reads lag writes.
+    *grow* duplicates under startup churn. Because this version never adds while a
+    row is present EXCEPT to apply a real params change, repeated passes with
+    unchanged params can only shrink the row count — so it always converges to
+    exactly one.
 
-    NOTE: because it never re-adds an existing row, it does NOT push param changes
-    (e.g. a refreshed Bedrock price) onto an already-registered model — undeploy +
-    redeploy the CR to apply changed litellm_params.
+    Param drift: when a row already exists but the CR's litellm_params have
+    changed (e.g. an edited Bedrock price/endpoint), we re-register (delete the
+    kept row + add with the new params) under the lock so LiteLLM reflects the
+    edit. Drift is detected conservatively (see _params_drifted) — it can only
+    trigger on a genuine change, never on steady state — so this does not
+    reintroduce churn.
     """
     with REGISTRY_LOCK:
         db_models = list_db_model_ids()
         if db_models is None:
             return False
-        ids = db_models.get(name, [])
-        if ids:
-            for extra_id in ids[1:]:
+        rows = db_models.get(name, [])
+        if rows:
+            keep_id, keep_params = rows[0]
+            for extra_id, _ in rows[1:]:
                 _litellm_request("POST", "/model/delete", {"id": extra_id})
-            if len(ids) > 1:
-                log.info("register %s: removed %d duplicate DB row(s)", name, len(ids) - 1)
+            if len(rows) > 1:
+                log.info("register %s: removed %d duplicate DB row(s)", name, len(rows) - 1)
+            if _params_drifted(keep_params, litellm_params):
+                # CR spec changed — re-register so the edit takes effect. Rare (an
+                # apply), so delete+add here can't churn on steady state.
+                _litellm_request("POST", "/model/delete", {"id": keep_id})
+                resp = _litellm_request("POST", "/model/new", {
+                    "model_name": name,
+                    "litellm_params": litellm_params,
+                })
+                if resp is None:
+                    return False
+                log.info("re-registered model %s — CR litellm_params changed", name)
             return True
         resp = _litellm_request("POST", "/model/new", {
             "model_name": name,
@@ -228,16 +281,16 @@ def deregister_model(name: str) -> bool:
         if db_models is None:
             log.warning("deregister %s: LiteLLM unreachable — will retry on reconcile", name)
             return False
-        ids = db_models.get(name, [])
-        if not ids:
+        rows = db_models.get(name, [])
+        if not rows:
             log.info("deregister %s: not a DB-registered model (already gone or static) — skipping", name)
             return True
         ok = True
-        for model_id in ids:
+        for model_id, _ in rows:
             if _litellm_request("POST", "/model/delete", {"id": model_id}) is None:
                 ok = False
         if ok:
-            log.info("deregistered model %s (%d row(s)) from LiteLLM", name, len(ids))
+            log.info("deregistered model %s (%d row(s)) from LiteLLM", name, len(rows))
         return ok
 
 
