@@ -442,7 +442,9 @@ def reconcile_loop() -> None:
 # ---------------------------------------------------------------------------
 
 def _health_server() -> None:
-    """Tiny :8080 server — 200 when the K8s API is reachable, else 503."""
+    """Tiny :8080 server — 200 when the K8s API is reachable and listable (or the
+    watched CRD is simply absent: 404); 503 on RBAC denial (403/401) or transport
+    failure, so a controller that can reconcile nothing never reports healthy."""
     import http.server
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -451,13 +453,20 @@ def _health_server() -> None:
                 client.CustomObjectsApi().list_cluster_custom_object(
                     group=SERVING_GROUP, version=CR_VERSION, plural="vllmendpoints", limit=1,
                 )
-            except ApiException:
-                # API server reachable, but the CRD may be absent (a Bedrock-only
-                # / kro=false install has no vllmendpoints CRD -> 404) or the list
-                # may be RBAC-scoped (403). Either way the API is up and the
-                # watch/reconcile loops handle missing CRDs by backoff, so we're
-                # healthy. Only a transport failure (below) is unhealthy.
-                pass
+            except ApiException as e:
+                # ONLY 404 is benign: the CRD isn't installed (a Bedrock-only /
+                # kro=false install has no vllmendpoints CRD), and the watch/
+                # reconcile loops back off until it appears. Any OTHER status is a
+                # real fault the probe MUST surface — in particular 403/401 means
+                # the ServiceAccount can't list the CRs it exists to reconcile
+                # (broken/rolled-back RBAC), so the controller registers nothing;
+                # reporting healthy there would hide a dead controller behind a
+                # green probe.
+                if e.status != 404:
+                    self.send_response(503)
+                    self.end_headers()
+                    self.wfile.write(f"kubernetes API error {e.status}: {e.reason}".encode())
+                    return
             except Exception as e:  # noqa: BLE001
                 self.send_response(503)
                 self.end_headers()
